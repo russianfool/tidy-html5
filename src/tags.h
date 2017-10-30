@@ -62,7 +62,7 @@ typedef enum
 
 /** This typedef describes a function to be used to parse HTML of a Tidy tag.
  */
-typedef void (Parser)( TidyDocImpl* doc, Node *node, GetTokenMode mode );
+typedef void* (Parser)( TidyDocImpl* doc, Node *node, GetTokenMode mode );
 
 
 /** This typedef describes a function be be used to check the attributes

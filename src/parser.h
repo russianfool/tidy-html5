@@ -58,7 +58,13 @@ Bool TY_(IsJavaScript)(Node *node);
 */
 void TY_(ParseDocument)( TidyDocImpl* doc );
 
-
+/* Continuation programming */
+typedef struct _continuation {
+    Parser* func;
+    TidyDocImpl* doc;
+    Node *node;
+    GetTokenMode mode;
+} parserContinuation;
 
 /*
   XML documents
