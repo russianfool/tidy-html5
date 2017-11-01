@@ -4578,7 +4578,7 @@ static void AttributeChecks(TidyDocImpl* doc, Node* node)
  ***************************************************************************/
 
 
-/**
+/** MARK: TY_(CheckNodeIntegrity)
  *  Is used to perform a node integrity check after parsing an HTML or XML
  *  document.
  *  @note Actual performance of this check can be disabled by defining the
@@ -4619,7 +4619,7 @@ Bool TY_(CheckNodeIntegrity)(Node *node)
 }
 
 
-/**
+/** MARK: TY_(IsNewNode)
  *  Used to check if a node uses CM_NEW, which determines how attributes
  *  without values should be printed. This was introduced to deal with
  *  user-defined tags e.g. ColdFusion.
@@ -4634,7 +4634,7 @@ Bool TY_(IsNewNode)(Node *node)
 }
 
 
-/**
+/** MARK: TY_(CoerceNode)
  *  Transforms a given node to another element, for example, from a <p>
  *  to a <br>.
  */
@@ -4662,7 +4662,7 @@ void TY_(CoerceNode)(TidyDocImpl* doc, Node *node, TidyTagId tid, Bool obsolete,
 }
 
 
-/**
+/** MARK: TY_(RemoveNode)
  *  Extract a node and its children from a markup tree
  */
 Node *TY_(RemoveNode)(Node *node)
@@ -4687,7 +4687,7 @@ Node *TY_(RemoveNode)(Node *node)
 }
 
 
-/**
+/** MARK: TY_(DiscardElement)
  *  Remove node from markup tree and discard it.
  */
 Node *TY_(DiscardElement)( TidyDocImpl* doc, Node *element )
@@ -4705,7 +4705,7 @@ Node *TY_(DiscardElement)( TidyDocImpl* doc, Node *element )
 }
 
 
-/**
+/** MARK: TY_(InsertNodeAtStart)
  *  Insert node into markup tree as the firt element of content of element.
  */
 void TY_(InsertNodeAtStart)(Node *element, Node *node)
@@ -4723,7 +4723,7 @@ void TY_(InsertNodeAtStart)(Node *element, Node *node)
 }
 
 
-/**
+/** MARK: TY_(InsertNodeAtEnd)
  *  Insert node into markup tree as the last element of content of element.
  */
 void TY_(InsertNodeAtEnd)(Node *element, Node *node)
@@ -4740,7 +4740,7 @@ void TY_(InsertNodeAtEnd)(Node *element, Node *node)
 }
 
 
-/**
+/** MARK: TY_(InsertNodeBeforeElement)
  *  Insert node into markup tree before element.
  */
 void TY_(InsertNodeBeforeElement)(Node *element, Node *node)
@@ -4761,7 +4761,7 @@ void TY_(InsertNodeBeforeElement)(Node *element, Node *node)
 }
 
 
-/**
+/** MARK: TY_(InsertNodeAfterElement)
  *  Insert node into markup tree after element.
  */
 void TY_(InsertNodeAfterElement)(Node *element, Node *node)
@@ -4787,7 +4787,7 @@ void TY_(InsertNodeAfterElement)(Node *element, Node *node)
 }
 
 
-/**
+/** MARK: TY_(TrimEmptyElement)
  *  Trims a single, empty element, returning the next node.
  */
 Node *TY_(TrimEmptyElement)( TidyDocImpl* doc, Node *element )
@@ -4806,7 +4806,7 @@ Node *TY_(TrimEmptyElement)( TidyDocImpl* doc, Node *element )
 }
 
 
-/**
+/** MARK: TY_(DropEmptyElements)
  *  Trims a tree of empty elements recursively, returning the next node.
  */
 Node* TY_(DropEmptyElements)(TidyDocImpl* doc, Node* node)
@@ -4835,7 +4835,7 @@ Node* TY_(DropEmptyElements)(TidyDocImpl* doc, Node* node)
 }
 
 
-/**
+/** MARK: TY_(IsBlank)
  *  Indicates whether or not a text node is blank, meaning that it consists
  *  of nothing, or a single space.
  */
@@ -4850,7 +4850,7 @@ Bool TY_(IsBlank)(Lexer *lexer, Node *node)
 }
 
 
-/**
+/** MARK: TY_(IsJavaScript)
  *  Indicates whether or not a node is declared as containing javascript
  *  code.
  */
@@ -4876,7 +4876,7 @@ Bool TY_(IsJavaScript)(Node *node)
 }
 
 
-/**
+/** MARK: TY_(ParseDocument)
  *  Parses an HTML document after lexing. It begins by properly configuring
  *  the overall HTML structure, and subsequently processes all remaining
  *  nodes.
@@ -5018,7 +5018,7 @@ void TY_(ParseDocument)(TidyDocImpl* doc)
 }
 
 
-/**
+/** MARK: TY_(XMLPreserveWhiteSpace)
  *  Indicates whether or not whitespace is to be preserved in XHTML/XML
  *  documents.
  */
@@ -5055,9 +5055,10 @@ Bool TY_(XMLPreserveWhiteSpace)( TidyDocImpl* doc, Node *element)
     return no;
 }
 
-/*
-  XML documents
-*/
+
+/** MARK: TY_(ParseXMLElement)
+ *  Parses the given XML element.
+ */
 static void ParseXMLElement(TidyDocImpl* doc, Node *element, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
@@ -5135,6 +5136,10 @@ static void ParseXMLElement(TidyDocImpl* doc, Node *element, GetTokenMode mode)
     }
 }
 
+
+/** MARK: TY_(ParseXMLDocument)
+ *  Parses the document using Tidy's XML parser.
+ */
 void TY_(ParseXMLDocument)(TidyDocImpl* doc)
 {
     Node *node, *doctype = NULL;
