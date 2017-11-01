@@ -1523,13 +1523,7 @@ void TY_(FreeNode)( TidyDocImpl* doc, Node *node )
         }
     }
 #endif
-    /* this is no good ;=((
-    if (node && doc && doc->lexer) {
-        if (node == doc->lexer->token) {
-            doc->lexer->token = NULL; // TY_(NewNode)( doc->lexer->allocator, doc->lexer );
-        }
-    }
-      ----------------- */
+
     while ( node )
     {
         Node* next = node->next;

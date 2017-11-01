@@ -14,161 +14,33 @@
 #include "tmbstr.h"
 #include "sprtf.h"
 
-/*
-  Issue #72 - Need to know to avoid error-reporting - no warning only if --show-body-only yes
-  Issue #132 - likewise avoid warning if showing body only
+
+/* Forward Declarations */
+static void* ParseTag( TidyDocImpl* doc, Node *node, GetTokenMode mode );
+
+
+/***************************************************************************//*
+ ** MARK: - Configuration Options
+ ***************************************************************************/
+
+
+/**
+ *  Issue #72  - Need to know to avoid error-reporting - no warning only if
+ *               --show-body-only yes.
+ *  Issue #132 - Likewise avoid warning if showing body only.
  */
 #define showingBodyOnly(doc) (cfgAutoBool(doc,TidyBodyOnly) == TidyYesState) ? yes : no
 
 
-Bool TY_(CheckNodeIntegrity)(Node *node)
-{
-#ifndef NO_NODE_INTEGRITY_CHECK
-    Node *child;
+/***************************************************************************//*
+ ** MARK: - Node Operations
+ ***************************************************************************/
 
-    if (node->prev)
-    {
-        if (node->prev->next != node)
-            return no;
-    }
 
-    if (node->next)
-    {
-        if (node->next == node || node->next->prev != node)
-            return no;
-    }
-
-    if (node->parent)
-    {
-        if (node->prev == NULL && node->parent->content != node)
-            return no;
-
-        if (node->next == NULL && node->parent->last != node)
-            return no;
-    }
-
-    for (child = node->content; child; child = child->next)
-        if ( child->parent != node || !TY_(CheckNodeIntegrity)(child) )
-            return no;
-
-#endif
-    return yes;
-}
-
-/*
- used to determine how attributes
- without values should be printed
- this was introduced to deal with
- user defined tags e.g. ColdFusion
-*/
-Bool TY_(IsNewNode)(Node *node)
-{
-    if (node && node->tag)
-    {
-        return (node->tag->model & CM_NEW);
-    }
-    return yes;
-}
-
-void TY_(CoerceNode)(TidyDocImpl* doc, Node *node, TidyTagId tid, Bool obsolete, Bool unexpected)
-{
-    const Dict* tag = TY_(LookupTagDef)(tid);
-    Node* tmp = TY_(InferredTag)(doc, tag->id);
-
-    if (obsolete)
-        TY_(Report)(doc, node, tmp, OBSOLETE_ELEMENT);
-    else if (unexpected)
-        TY_(Report)(doc, node, tmp, REPLACING_UNEX_ELEMENT);
-    else
-        TY_(Report)(doc, node, tmp, REPLACING_ELEMENT);
-
-    TidyDocFree(doc, tmp->element);
-    TidyDocFree(doc, tmp);
-
-    node->was = node->tag;
-    node->tag = tag;
-    node->type = StartTag;
-    node->implicit = yes;
-    TidyDocFree(doc, node->element);
-    node->element = TY_(tmbstrdup)(doc->allocator, tag->name);
-}
-
-/* extract a node and its children from a markup tree */
-Node *TY_(RemoveNode)(Node *node)
-{
-    if (node->prev)
-        node->prev->next = node->next;
-
-    if (node->next)
-        node->next->prev = node->prev;
-
-    if (node->parent)
-    {
-        if (node->parent->content == node)
-            node->parent->content = node->next;
-
-        if (node->parent->last == node)
-            node->parent->last = node->prev;
-    }
-
-    node->parent = node->prev = node->next = NULL;
-    return node;
-}
-
-/* remove node from markup tree and discard it */
-Node *TY_(DiscardElement)( TidyDocImpl* doc, Node *element )
-{
-    Node *next = NULL;
-
-    if (element)
-    {
-        next = element->next;
-        TY_(RemoveNode)(element);
-        TY_(FreeNode)( doc, element);
-    }
-
-    return next;
-}
-
-/*
- insert "node" into markup tree as the firt element
- of content of "element"
-*/
-void TY_(InsertNodeAtStart)(Node *element, Node *node)
-{
-    node->parent = element;
-
-    if (element->content == NULL)
-        element->last = node;
-    else
-        element->content->prev = node;
-
-    node->next = element->content;
-    node->prev = NULL;
-    element->content = node;
-}
-
-/*
- insert "node" into markup tree as the last element
- of content of "element"
-*/
-void TY_(InsertNodeAtEnd)(Node *element, Node *node)
-{
-    node->parent = element;
-    node->prev = element->last;
-
-    if (element->last != NULL)
-        element->last->next = node;
-    else
-        element->content = node;
-
-    element->last = node;
-}
-
-/*
- insert "node" into markup tree in place of "element"
- which is moved to become the child of the node
-*/
+/**
+ *  Insert "node" into markup tree in place of "element"
+ *  which is moved to become the child of the node
+ */
 static void InsertNodeAsParent(Node *element, Node *node)
 {
     node->content = element;
@@ -195,47 +67,172 @@ static void InsertNodeAsParent(Node *element, Node *node)
         node->next->prev = node;
 }
 
-/* insert "node" into markup tree before "element" */
-void TY_(InsertNodeBeforeElement)(Node *element, Node *node)
+
+/**
+ *  Inserts node into element at an appropriate location based
+ *  on the type of node being inserted.
+ */
+static Bool InsertMisc(Node *element, Node *node)
 {
-    Node *parent;
-
-    parent = element->parent;
-    node->parent = parent;
-    node->next = element;
-    node->prev = element->prev;
-    element->prev = node;
-
-    if (node->prev)
-        node->prev->next = node;
-
-    if (parent->content == element)
-        parent->content = node;
-}
-
-/* insert "node" into markup tree after "element" */
-void TY_(InsertNodeAfterElement)(Node *element, Node *node)
-{
-    Node *parent;
-
-    parent = element->parent;
-    node->parent = parent;
-
-    /* AQ - 13 Jan 2000 fix for parent == NULL */
-    if (parent != NULL && parent->last == element)
-        parent->last = node;
-    else
+    if (node->type == CommentTag ||
+        node->type == ProcInsTag ||
+        node->type == CDATATag ||
+        node->type == SectionTag ||
+        node->type == AspTag ||
+        node->type == JsteTag ||
+        node->type == PhpTag )
     {
-        node->next = element->next;
-        /* AQ - 13 Jan 2000 fix for node->next == NULL */
-        if (node->next != NULL)
-            node->next->prev = node;
+        TY_(InsertNodeAtEnd)(element, node);
+        return yes;
     }
 
-    element->next = node;
-    node->prev = element;
+    if ( node->type == XmlDecl )
+    {
+        Node* root = element;
+        while ( root && root->parent )
+            root = root->parent;
+        if ( root && !(root->content && root->content->type == XmlDecl))
+        {
+          TY_(InsertNodeAtStart)( root, node );
+          return yes;
+        }
+    }
+
+    /* Declared empty tags seem to be slipping through
+    ** the cracks.  This is an experiment to figure out
+    ** a decent place to pick them up.
+    */
+    if ( node->tag &&
+         TY_(nodeIsElement)(node) &&
+         TY_(nodeCMIsEmpty)(node) && TagId(node) == TidyTag_UNKNOWN &&
+         (node->tag->versions & VERS_PROPRIETARY) != 0 )
+    {
+        TY_(InsertNodeAtEnd)(element, node);
+        return yes;
+    }
+
+    return no;
 }
 
+
+/**
+ *  Move node to the head, where element is used as starting
+ *  point in hunt for head. normally called during parsing.
+ */
+static void MoveToHead( TidyDocImpl* doc, Node *element, Node *node )
+{
+    Node *head;
+
+    TY_(RemoveNode)( node );  /* make sure that node is isolated */
+
+    if ( TY_(nodeIsElement)(node) )
+    {
+        TY_(Report)(doc, element, node, TAG_NOT_ALLOWED_IN );
+
+        head = TY_(FindHEAD)(doc);
+        assert(head != NULL);
+
+        TY_(InsertNodeAtEnd)(head, node);
+
+        if ( node->tag->parser )
+            ParseTag( doc, node, IgnoreWhitespace );
+    }
+    else
+    {
+        TY_(Report)(doc, element, node, DISCARDING_UNEXPECTED);
+        TY_(FreeNode)( doc, node );
+    }
+}
+
+
+/**
+ *  Moves given node to end of body element.
+ */
+static void MoveNodeToBody( TidyDocImpl* doc, Node* node )
+{
+    Node* body = TY_(FindBody)( doc );
+    if ( body )
+    {
+        TY_(RemoveNode)( node );
+        TY_(InsertNodeAtEnd)( body, node );
+    }
+}
+
+
+/**
+ *  Unexpected content in table row is moved to just before the table in
+ *  in accordance with Netscape and IE. This code assumes that node hasn't
+ *  been inserted into the row.
+ */
+static void MoveBeforeTable( TidyDocImpl* ARG_UNUSED(doc), Node *row,
+                            Node *node )
+{
+    Node *table;
+
+    /* first find the table element */
+    for (table = row->parent; table; table = table->parent)
+    {
+        if ( nodeIsTABLE(table) )
+        {
+            TY_(InsertNodeBeforeElement)( table, node );
+            return;
+        }
+    }
+    /* No table element */
+    TY_(InsertNodeBeforeElement)( row->parent, node );
+}
+
+
+/**
+ *  Generalised search for duplicate elements.
+ *  Issue #166 - repeated <main> element.
+ */
+static Bool findNodeWithId( Node *node, TidyTagId tid )
+{
+    Node *content;
+    while (node)
+    {
+        if (TagIsId(node,tid))
+            return yes;
+        /*\
+         *   Issue #459 - Under certain circumstances, with many node this use of
+         *   'for (content = node->content; content; content = content->content)'
+         *   would produce a **forever** circle, or at least a very extended loop...
+         *   It is sufficient to test the content, if it exists,
+         *   to quickly iterate all nodes. Now all nodes are tested only once.
+        \*/
+        content = node->content;
+        if (content)
+        {
+            if ( findNodeWithId(content,tid) )
+                return yes;
+        }
+        node = node->next;
+    }
+    return no;
+}
+
+
+/**
+ *  Perform a global search for an element.
+ *  Issue #166 - repeated <main> element
+ */
+static Bool findNodeById( TidyDocImpl* doc, TidyTagId tid )
+{
+    Node *node = (doc ? doc->root.content : NULL);
+    return findNodeWithId( node,tid );
+}
+
+
+/***************************************************************************//*
+ ** MARK: - Decision Making
+ ***************************************************************************/
+
+
+/**
+ *  Indicates whether or not element can be pruned based on content,
+ *  user settings, etc.
+ */
 static Bool CanPrune( TidyDocImpl* doc, Node *element )
 {
     if ( !cfgBool(doc, TidyDropEmptyElems) )
@@ -321,150 +318,27 @@ static Bool CanPrune( TidyDocImpl* doc, Node *element )
     return yes;
 }
 
-/* return next element */
-Node *TY_(TrimEmptyElement)( TidyDocImpl* doc, Node *element )
+
+/**
+ *  Indicates whether or not node is a descendant of a tag of the given tid.
+ */
+static Bool DescendantOf( Node *element, TidyTagId tid )
 {
-    if ( CanPrune(doc, element) )
+    Node *parent;
+    for ( parent = element->parent;
+         parent != NULL;
+         parent = parent->parent )
     {
-        if (element->type != TextNode)
-        {
-            doc->footnotes |= FN_TRIM_EMPTY_ELEMENT;
-            TY_(Report)(doc, element, NULL, TRIM_EMPTY_ELEMENT);
-        }
-        
-        return TY_(DiscardElement)(doc, element);
+        if ( TagIsId(parent, tid) )
+            return yes;
     }
-    return element->next;
+    return no;
 }
 
-Node* TY_(DropEmptyElements)(TidyDocImpl* doc, Node* node)
-{
-    Node* next;
 
-    while (node)
-    {
-        next = node->next;
-
-        if (node->content)
-            TY_(DropEmptyElements)(doc, node->content);
-
-        if (!TY_(nodeIsElement)(node) &&
-            !(TY_(nodeIsText)(node) && !(node->start < node->end)))
-        {
-            node = next;
-            continue;
-        }
-
-        next = TY_(TrimEmptyElement)(doc, node);
-        node = next;
-    }
-
-    return node;
-}
-
-/* 
-  errors in positioning of form start or end tags
-  generally require human intervention to fix
-  Issue #166 - repeated <main> element also uses this flag
-  to indicate duplicates, discarded
-*/
-static void BadForm( TidyDocImpl* doc )
-{
-    doc->badForm |= flg_BadForm;
-    /* doc->errors++; */
-}
-
-/*
-  This maps 
-       <em>hello </em><strong>world</strong>
-  to
-       <em>hello</em> <strong>world</strong>
-
-  If last child of element is a text node
-  then trim trailing white space character
-  moving it to after element's end tag.
-*/
-static void TrimTrailingSpace( TidyDocImpl* doc, Node *element, Node *last )
-{
-    Lexer* lexer = doc->lexer;
-    byte c;
-
-    if (TY_(nodeIsText)(last))
-    {
-        if (last->end > last->start)
-        {
-            c = (byte) lexer->lexbuf[ last->end - 1 ];
-
-            if ( c == ' ' )
-            {
-                last->end -= 1;
-                if ( (element->tag->model & CM_INLINE) &&
-                     !(element->tag->model & CM_FIELD) )
-                    lexer->insertspace = yes;
-            }
-        }
-    }
-}
-
-/* Only true for text nodes. */
-Bool TY_(IsBlank)(Lexer *lexer, Node *node)
-{
-    Bool isBlank = TY_(nodeIsText)(node);
-    if ( isBlank )
-        isBlank = ( node->end == node->start ||       /* Zero length */
-                    ( node->end == node->start+1      /* or one blank. */
-                      && lexer->lexbuf[node->start] == ' ' ) );
-    return isBlank;
-}
-
-/*
-  This maps 
-       <p>hello<em> world</em>
-  to
-       <p>hello <em>world</em>
-
-  Trims initial space, by moving it before the
-  start tag, or if this element is the first in
-  parent's content, then by discarding the space
-*/
-static void TrimInitialSpace( TidyDocImpl* doc, Node *element, Node *text )
-{
-    Lexer* lexer = doc->lexer;
-    Node *prev, *node;
-
-    if ( TY_(nodeIsText)(text) && 
-         lexer->lexbuf[text->start] == ' ' && 
-         text->start < text->end )
-    {
-        if ( (element->tag->model & CM_INLINE) &&
-             !(element->tag->model & CM_FIELD) )
-        {
-            prev = element->prev;
-
-            if (TY_(nodeIsText)(prev))
-            {
-                if (prev->end == 0 || lexer->lexbuf[prev->end - 1] != ' ')
-                    lexer->lexbuf[(prev->end)++] = ' ';
-
-                ++(element->start);
-            }
-            else /* create new node */
-            {
-                node = TY_(NewNode)(lexer->allocator, lexer);
-                node->start = (element->start)++;
-                node->end = element->start;
-                lexer->lexbuf[node->start] = ' ';
-                TY_(InsertNodeBeforeElement)(element ,node);
-                DEBUG_LOG(SPRTF("TrimInitialSpace: Created text node, inserted before <%s>\n",
-                    (element->element ? element->element : "unknown")));
-            }
-        }
-
-        /* discard the space in current node */
-        ++(text->start);
-    }
-}
-
+/**
+ *  Indicates whether or not node is a descendant of a pre tag.
+ */
 static Bool IsPreDescendant(Node* node)
 {
     Node *parent = node->parent;
@@ -480,6 +354,10 @@ static Bool IsPreDescendant(Node* node)
     return no;
 }
 
+
+/**
+ *  Indicates whether or not trailing whitespace should be cleaned.
+ */
 static Bool CleanTrailingWhitespace(TidyDocImpl* doc, Node* node)
 {
     Node* next;
@@ -531,6 +409,10 @@ static Bool CleanTrailingWhitespace(TidyDocImpl* doc, Node* node)
     return no;
 }
 
+
+/**
+ *  Indicates whether or not leading whitespace should be cleaned.
+ */
 static Bool CleanLeadingWhitespace(TidyDocImpl* ARG_UNUSED(doc), Node* node)
 {
     if (!TY_(nodeIsText)(node))
@@ -565,6 +447,144 @@ static Bool CleanLeadingWhitespace(TidyDocImpl* ARG_UNUSED(doc), Node* node)
     return no;
 }
 
+
+/**
+ *  Indicates whether or not the content of the given node is acceptable
+ *  content for pre elements
+ */
+static Bool PreContent( TidyDocImpl* ARG_UNUSED(doc), Node* node )
+{
+    /* p is coerced to br's, Text OK too */
+    if ( nodeIsP(node) || TY_(nodeIsText)(node) )
+        return yes;
+
+    if ( node->tag == NULL ||
+         nodeIsPARAM(node) ||
+         !TY_(nodeHasCM)(node, CM_INLINE|CM_NEW) )
+        return no;
+
+    return yes;
+}
+
+
+/**
+ *  Indicates whether or not the only content model for the given node
+ *  is CM_INLINE.
+ */
+static Bool nodeCMIsOnlyInline( Node* node )
+{
+    return TY_(nodeHasCM)( node, CM_INLINE ) && !TY_(nodeHasCM)( node, CM_BLOCK );
+}
+
+
+/***************************************************************************//*
+ ** MARK: - Information Accumulation
+ ***************************************************************************/
+
+
+/**
+ *  Errors in positioning of form start or end tags
+ *  generally require human intervention to fix.
+ *  Issue #166 - repeated <main> element also uses this flag
+ *  to indicate duplicates, discarded.
+ */
+static void BadForm( TidyDocImpl* doc )
+{
+    doc->badForm |= flg_BadForm;
+}
+
+
+/***************************************************************************//*
+ ** MARK: - Fixes and Touchup
+ ***************************************************************************/
+
+
+/**
+ *  This maps
+ *     <em>hello </em><strong>world</strong>
+ *  to
+ *     <em>hello</em> <strong>world</strong>
+ *
+ *  If last child of element is a text node
+ *  then trim trailing white space character
+ *  moving it to after element's end tag.
+ */
+static void TrimTrailingSpace( TidyDocImpl* doc, Node *element, Node *last )
+{
+    Lexer* lexer = doc->lexer;
+    byte c;
+
+    if (TY_(nodeIsText)(last))
+    {
+        if (last->end > last->start)
+        {
+            c = (byte) lexer->lexbuf[ last->end - 1 ];
+
+            if ( c == ' ' )
+            {
+                last->end -= 1;
+                if ( (element->tag->model & CM_INLINE) &&
+                     !(element->tag->model & CM_FIELD) )
+                    lexer->insertspace = yes;
+            }
+        }
+    }
+}
+
+
+/**
+ *  This maps
+ *     <p>hello<em> world</em>
+ *  to
+ *     <p>hello <em>world</em>
+ *
+ *  Trims initial space, by moving it before the
+ *  start tag, or if this element is the first in
+ *  parent's content, then by discarding the space
+ */
+static void TrimInitialSpace( TidyDocImpl* doc, Node *element, Node *text )
+{
+    Lexer* lexer = doc->lexer;
+    Node *prev, *node;
+
+    if ( TY_(nodeIsText)(text) && 
+         lexer->lexbuf[text->start] == ' ' && 
+         text->start < text->end )
+    {
+        if ( (element->tag->model & CM_INLINE) &&
+             !(element->tag->model & CM_FIELD) )
+        {
+            prev = element->prev;
+
+            if (TY_(nodeIsText)(prev))
+            {
+                if (prev->end == 0 || lexer->lexbuf[prev->end - 1] != ' ')
+                    lexer->lexbuf[(prev->end)++] = ' ';
+
+                ++(element->start);
+            }
+            else /* create new node */
+            {
+                node = TY_(NewNode)(lexer->allocator, lexer);
+                node->start = (element->start)++;
+                node->end = element->start;
+                lexer->lexbuf[node->start] = ' ';
+                TY_(InsertNodeBeforeElement)(element ,node);
+                DEBUG_LOG(SPRTF("TrimInitialSpace: Created text node, inserted before <%s>\n",
+                    (element->element ? element->element : "unknown")));
+            }
+        }
+
+        /* discard the space in current node */
+        ++(text->start);
+    }
+}
+
+
+/**
+ *  Cleans whitespace from text nodes, and drops such nodes if emptied
+ *  completely as a result.
+ */
 static void CleanSpaces(TidyDocImpl* doc, Node* node)
 {
     Node* next;
@@ -597,18 +617,18 @@ static void CleanSpaces(TidyDocImpl* doc, Node* node)
     }
 }
 
-/* 
-  Move initial and trailing space out.
-  This routine maps:
 
-       hello<em> world</em>
-  to
-       hello <em>world</em>
-  and
-       <em>hello </em><strong>world</strong>
-  to
-       <em>hello</em> <strong>world</strong>
-*/
+/**
+ *  Move initial and trailing space out.
+ *  This routine maps:
+ *     hello<em> world</em>
+ *  to
+ *     hello <em>world</em>
+ *  and
+ *     <em>hello </em><strong>world</strong>
+ *  to
+ *     <em>hello</em> <strong>world</strong>
+ */
 static void TrimSpaces( TidyDocImpl* doc, Node *element)
 {
     Node* text = element->content;
@@ -625,97 +645,11 @@ static void TrimSpaces( TidyDocImpl* doc, Node *element)
         TrimTrailingSpace(doc, element, text);
 }
 
-static Bool DescendantOf( Node *element, TidyTagId tid )
-{
-    Node *parent;
-    for ( parent = element->parent;
-          parent != NULL;
-          parent = parent->parent )
-    {
-        if ( TagIsId(parent, tid) )
-            return yes;
-    }
-    return no;
-}
 
-static Bool InsertMisc(Node *element, Node *node)
-{
-    if (node->type == CommentTag ||
-        node->type == ProcInsTag ||
-        node->type == CDATATag ||
-        node->type == SectionTag ||
-        node->type == AspTag ||
-        node->type == JsteTag ||
-        node->type == PhpTag )
-    {
-        TY_(InsertNodeAtEnd)(element, node);
-        return yes;
-    }
-
-    if ( node->type == XmlDecl )
-    {
-        Node* root = element;
-        while ( root && root->parent )
-            root = root->parent;
-        if ( root && !(root->content && root->content->type == XmlDecl))
-        {
-          TY_(InsertNodeAtStart)( root, node );
-          return yes;
-        }
-    }
-
-    /* Declared empty tags seem to be slipping through
-    ** the cracks.  This is an experiment to figure out
-    ** a decent place to pick them up.
-    */
-    if ( node->tag &&
-         TY_(nodeIsElement)(node) &&
-         TY_(nodeCMIsEmpty)(node) && TagId(node) == TidyTag_UNKNOWN &&
-         (node->tag->versions & VERS_PROPRIETARY) != 0 )
-    {
-        TY_(InsertNodeAtEnd)(element, node);
-        return yes;
-    }
-
-    return no;
-}
-
-
-static void ParseTag( TidyDocImpl* doc, Node *node, GetTokenMode mode )
-{
-    Lexer* lexer = doc->lexer;
-
-    if (node->tag == NULL) /* [i_a]2 prevent crash for active content (php, asp) docs */
-        return;
-
-    /*
-       Fix by GLP 2000-12-21.  Need to reset insertspace if this 
-       is both a non-inline and empty tag (base, link, meta, isindex, hr, area).
-    */
-    if (node->tag->model & CM_EMPTY)
-    {
-        lexer->waswhite = no;
-        if (node->tag->parser == NULL)
-            return;
-    }
-    else if (!(node->tag->model & CM_INLINE))
-        lexer->insertspace = no;
-
-    if (node->tag->parser == NULL)
-        return;
-
-    if (node->type == StartEndTag)
-        return;
-
-    lexer->parent = node; /* [i_a]2 added this - not sure why - CHECKME: */
-
-    (*node->tag->parser)( doc, node, mode );
-}
-
-/*
- the doctype has been found after other tags,
- and needs moving to before the html element
-*/
+/**
+ *  The doctype has been found after other tags,
+ *  and needs moving to before the html element
+ */
 static void InsertDocType( TidyDocImpl* doc, Node *element, Node *doctype )
 {
     Node* existing = TY_(FindDocType)( doc );
@@ -733,51 +667,17 @@ static void InsertDocType( TidyDocImpl* doc, Node *element, Node *doctype )
     }
 }
 
-/*
- move node to the head, where element is used as starting
- point in hunt for head. normally called during parsing
-*/
-static void MoveToHead( TidyDocImpl* doc, Node *element, Node *node )
-{
-    Node *head;
 
-    TY_(RemoveNode)( node );  /* make sure that node is isolated */
 
-    if ( TY_(nodeIsElement)(node) )
-    {
-        TY_(Report)(doc, element, node, TAG_NOT_ALLOWED_IN );
-
-        head = TY_(FindHEAD)(doc);
-        assert(head != NULL);
-
-        TY_(InsertNodeAtEnd)(head, node);
-
-        if ( node->tag->parser )
-            ParseTag( doc, node, IgnoreWhitespace );
-    }
-    else
-    {
-        TY_(Report)(doc, element, node, DISCARDING_UNEXPECTED);
-        TY_(FreeNode)( doc, node );
-    }
-}
-
-/* moves given node to end of body element */
-static void MoveNodeToBody( TidyDocImpl* doc, Node* node )
-{
-    Node* body = TY_(FindBody)( doc );
-    if ( body )
-    {
-        TY_(RemoveNode)( node );
-        TY_(InsertNodeAtEnd)( body, node );
-    }
-}
-
+/**
+ *  Adds style information as a class in the document or a property
+ *  of the node to prevent indentation of inferred UL tags.
+ */
 static void AddClassNoIndent( TidyDocImpl* doc, Node *node )
 {
     ctmbstr sprop =
-        "padding-left: 2ex; margin-left: 0ex"
-        "; margin-top: 0ex; margin-bottom: 0ex";
+    "padding-left: 2ex; margin-left: 0ex"
+    "; margin-top: 0ex; margin-bottom: 0ex";
     if ( !cfgBool(doc, TidyDecorateInferredUL) )
         return;
     if ( cfgBool(doc, TidyMakeClean) )
@@ -786,11 +686,163 @@ static void AddClassNoIndent( TidyDocImpl* doc, Node *node )
         TY_(AddStyleProperty)( doc, node, sprop );
 }
 
-/*
-   element is node created by the lexer
-   upon seeing the start tag, or by the
-   parser when the start tag is inferred
-*/
+
+/**
+ *  If a table row is empty then insert an empty cell. This practice is
+ *  consistent with browser behavior and avoids potential problems with
+ *  row spanning cells.
+ */
+static void FixEmptyRow(TidyDocImpl* doc, Node *row)
+{
+    Node *cell;
+
+    if (row->content == NULL)
+    {
+        cell = TY_(InferredTag)(doc, TidyTag_TD);
+        TY_(InsertNodeAtEnd)(row, cell);
+        TY_(Report)(doc, row, cell, MISSING_STARTTAG);
+    }
+}
+
+
+/***************************************************************************//*
+ ** MARK: - Parsers Support
+ ***************************************************************************/
+
+
+/**
+ *  Structure used by FindDescendant_cb.
+ */
+struct MatchingDescendantData
+{
+    Node *found_node;
+    Bool *passed_marker_node;
+
+    /* input: */
+    TidyTagId matching_tagId;
+    Node *node_to_find;
+    Node *marker_node;
+};
+
+
+/**
+ *  The main engine for FindMatchingDescendant.
+ */
+static NodeTraversalSignal FindDescendant_cb(TidyDocImpl* ARG_UNUSED(doc), Node* node, void *propagate)
+{
+    struct MatchingDescendantData *cb_data = (struct MatchingDescendantData *)propagate;
+
+    if (TagId(node) == cb_data->matching_tagId)
+    {
+        /* make sure we match up 'unknown' tags exactly! */
+        if (cb_data->matching_tagId != TidyTag_UNKNOWN ||
+            (node->element != NULL &&
+            cb_data->node_to_find != NULL &&
+            cb_data->node_to_find->element != NULL &&
+            0 == TY_(tmbstrcmp)(cb_data->node_to_find->element, node->element)))
+        {
+            cb_data->found_node = node;
+            return ExitTraversal;
+        }
+    }
+
+    if (cb_data->passed_marker_node && node == cb_data->marker_node)
+        *cb_data->passed_marker_node = yes;
+
+    return VisitParent;
+}
+
+
+/**
+ *  Search the parent chain (from `parent` upwards up to the root) for a node
+ *  matching the given 'node'.
+ *
+ *  When the search passes beyond the `marker_node` (which is assumed to sit
+ *  in the parent chain), this will be flagged by setting the boolean
+ *  referenced by `is_parent_of_marker` to `yes`.
+ *
+ *  'is_parent_of_marker' and 'marker_node' are optional parameters and may
+ *  be NULL.
+ */
+static Node *FindMatchingDescendant( Node *parent, Node *node, Node *marker_node, Bool *is_parent_of_marker )
+{
+    struct MatchingDescendantData cb_data = { 0 };
+    cb_data.matching_tagId = TagId(node);
+    cb_data.node_to_find = node;
+    cb_data.marker_node = marker_node;
+
+    assert(node);
+
+    if (is_parent_of_marker)
+        *is_parent_of_marker = no;
+
+    TY_(TraverseNodeTree)(NULL, parent, FindDescendant_cb, &cb_data);
+    return cb_data.found_node;
+}
+
+
+/**
+ *   Finds the last list item for the given list, providing it in the
+ *   in-out parameter. Returns yes or no if the item was the last list
+ *   item.
+ */
+static Bool FindLastLI( Node *list, Node **lastli )
+{
+    Node *node;
+
+    *lastli = NULL;
+    for ( node = list->content; node ; node = node->next )
+        if ( nodeIsLI(node) && node->type == StartTag )
+            *lastli=node;
+    return *lastli ? yes:no;
+}
+
+
+/***************************************************************************//*
+ ** MARK: - Parsers
+ ***************************************************************************/
+
+
+/**
+ *  Instantiates the correct parser for the given node.
+ */
+static void* ParseTag( TidyDocImpl* doc, Node *node, GetTokenMode mode )
+{
+    Lexer* lexer = doc->lexer;
+
+    if (node->tag == NULL) /* [i_a]2 prevent crash for active content (php, asp) docs */
+        return NULL;
+
+    /*
+       Fix by GLP 2000-12-21.  Need to reset insertspace if this
+       is both a non-inline and empty tag (base, link, meta, isindex, hr, area).
+    */
+    if (node->tag->model & CM_EMPTY)
+    {
+        lexer->waswhite = no;
+        if (node->tag->parser == NULL)
+            return NULL;
+    }
+    else if (!(node->tag->model & CM_INLINE))
+        lexer->insertspace = no;
+
+    if (node->tag->parser == NULL)
+        return NULL;
+
+    if (node->type == StartEndTag)
+        return NULL;
+
+    lexer->parent = node; /* [i_a]2 added this - not sure why - CHECKME: */
+
+    (*node->tag->parser)( doc, node, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseBlock)
+ *  `element` is a node created by the lexer upon seeing the start tag, or
+ *  by the parser when the start tag is inferred
+ */
 void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
 {
 #if defined(ENABLE_DEBUG_LOG)
@@ -1338,6 +1390,7 @@ void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
     }
 
     TrimSpaces( doc, element );
+
 #if defined(ENABLE_DEBUG_LOG)
     in_parse_block--;
     SPRTF("Exit ParseBlock 10 %d...\n",in_parse_block);
@@ -1345,73 +1398,13 @@ void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
     return NULL;
 }
 
-/* [i_a] svg / math */
 
-struct MatchingDescendantData
-{
-    Node *found_node;
-    Bool *passed_marker_node;
-
-    /* input: */
-    TidyTagId matching_tagId;
-    Node *node_to_find;
-    Node *marker_node;
-};
-
-static NodeTraversalSignal FindDescendant_cb(TidyDocImpl* ARG_UNUSED(doc), Node* node, void *propagate)
-{
-    struct MatchingDescendantData *cb_data = (struct MatchingDescendantData *)propagate;
-
-    if (TagId(node) == cb_data->matching_tagId)
-    {
-        /* make sure we match up 'unknown' tags exactly! */
-        if (cb_data->matching_tagId != TidyTag_UNKNOWN ||
-            (node->element != NULL &&
-            cb_data->node_to_find != NULL &&
-            cb_data->node_to_find->element != NULL &&
-            0 == TY_(tmbstrcmp)(cb_data->node_to_find->element, node->element)))
-        {
-            cb_data->found_node = node;
-            return ExitTraversal;
-        }
-    }
-
-    if (cb_data->passed_marker_node && node == cb_data->marker_node)
-        *cb_data->passed_marker_node = yes;
-
-    return VisitParent;
-}
-
-/*
-Search the parent chain (from 'parent' upwards up to the root) for a node matching the
-given 'node'.
-
-When the search passes beyond the 'marker_node' (which is assumed to sit in the
-parent chain), this will be flagged by setting the boolean referenced by
-'is_parent_of_marker' to yes.
-
-'is_parent_of_marker' and 'marker_node' are optional parameters and may be NULL.
-*/
-static Node *FindMatchingDescendant( Node *parent, Node *node, Node *marker_node, Bool *is_parent_of_marker )
-{
-    struct MatchingDescendantData cb_data = { 0 };
-    cb_data.matching_tagId = TagId(node);
-    cb_data.node_to_find = node;
-    cb_data.marker_node = marker_node;
-
-    assert(node);
-
-    if (is_parent_of_marker)
-        *is_parent_of_marker = no;
-
-    TY_(TraverseNodeTree)(NULL, parent, FindDescendant_cb, &cb_data);
-    return cb_data.found_node;
-}
-
-/*
-   Act as a generic XML (sub)tree parser: collect each node and add it to the DOM, without any further validation.
-   TODO : add schema- or other-hierarchy-definition-based validation of the subtree here...
-*/
+/** MARK: TY_(ParseNamespace)
+ *  Act as a generic XML (sub)tree parser: collect each node and add it
+ *  to the DOM, without any further validation.
+ *  @todo Add schema- or other-hierarchy-definition-based validation
+ *    of the subtree here.
+ */
 void* TY_(ParseNamespace)(TidyDocImpl* doc, Node *basenode, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
@@ -1538,6 +1531,9 @@ void* TY_(ParseNamespace)(TidyDocImpl* doc, Node *basenode, GetTokenMode mode)
 }
 
 
+/** MARK: TY_(ParseInline)
+ *  Parse inline element nodes.
+ */
 void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
 {
 #if defined(ENABLE_DEBUG_LOG)
@@ -2147,6 +2143,10 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
     return NULL;
 }
 
+
+/** MARK: TY_(ParseEmpty)
+ *  Parse empty element nodes.
+ */
 void* TY_(ParseEmpty)(TidyDocImpl* doc, Node *element, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
@@ -2169,6 +2169,10 @@ void* TY_(ParseEmpty)(TidyDocImpl* doc, Node *element, GetTokenMode mode)
     return NULL;
 }
 
+
+/** MARK: TY_(ParseDefList)
+ *  Parses the `dl` tag.
+ */
 void* TY_(ParseDefList)(TidyDocImpl* doc, Node *list, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
@@ -2318,17 +2322,10 @@ void* TY_(ParseDefList)(TidyDocImpl* doc, Node *list, GetTokenMode mode)
     return NULL;
 }
 
-static Bool FindLastLI( Node *list, Node **lastli )
-{
-    Node *node;
 
-    *lastli = NULL;
-    for ( node = list->content; node ; node = node->next )
-        if ( nodeIsLI(node) && node->type == StartTag )
-            *lastli=node;
-    return *lastli ? yes:no;
-}
-
+/** MARK: TY_(ParseList)
+ *  Parses list tags.
+ */
 void* TY_(ParseList)(TidyDocImpl* doc, Node *list, GetTokenMode ARG_UNUSED(mode))
 {
 #if defined(ENABLE_DEBUG_LOG)
@@ -2518,46 +2515,10 @@ void* TY_(ParseList)(TidyDocImpl* doc, Node *list, GetTokenMode ARG_UNUSED(mode)
     return NULL;
 }
 
-/*
- unexpected content in table row is moved to just before
- the table in accordance with Netscape and IE. This code
- assumes that node hasn't been inserted into the row.
-*/
-static void MoveBeforeTable( TidyDocImpl* ARG_UNUSED(doc), Node *row,
-                             Node *node )
-{
-    Node *table;
 
-    /* first find the table element */
-    for (table = row->parent; table; table = table->parent)
-    {
-        if ( nodeIsTABLE(table) )
-        {
-            TY_(InsertNodeBeforeElement)( table, node );
-            return;
-        }
-    }
-    /* No table element */
-    TY_(InsertNodeBeforeElement)( row->parent, node );
-}
-
-/*
- if a table row is empty then insert an empty cell
- this practice is consistent with browser behavior
- and avoids potential problems with row spanning cells
-*/
-static void FixEmptyRow(TidyDocImpl* doc, Node *row)
-{
-    Node *cell;
-
-    if (row->content == NULL)
-    {
-        cell = TY_(InferredTag)(doc, TidyTag_TD);
-        TY_(InsertNodeAtEnd)(row, cell);
-        TY_(Report)(doc, row, cell, MISSING_STARTTAG);
-    }
-}
-
+/** MARK: TY_(ParseRow)
+ *  Parses the `row` tag.
+ */
 void* TY_(ParseRow)(TidyDocImpl* doc, Node *row, GetTokenMode ARG_UNUSED(mode))
 {
     Lexer* lexer = doc->lexer;
@@ -2709,6 +2670,10 @@ void* TY_(ParseRow)(TidyDocImpl* doc, Node *row, GetTokenMode ARG_UNUSED(mode))
     return NULL;
 }
 
+
+/** MARK: TY_(ParseRowGroup)
+ *  Parses the `rowgroup` tag.
+ */
 void* TY_(ParseRowGroup)(TidyDocImpl* doc, Node *rowgroup, GetTokenMode ARG_UNUSED(mode))
 {
     Lexer* lexer = doc->lexer;
@@ -2855,6 +2820,10 @@ void* TY_(ParseRowGroup)(TidyDocImpl* doc, Node *rowgroup, GetTokenMode ARG_UNUS
     return NULL;
 }
 
+
+/** MARK: TY_(ParseColGroup)
+ *  Parses the `colgroup` tag.
+ */
 void* TY_(ParseColGroup)(TidyDocImpl* doc, Node *colgroup, GetTokenMode ARG_UNUSED(mode))
 {
     Node *node, *parent;
@@ -2935,6 +2904,10 @@ void* TY_(ParseColGroup)(TidyDocImpl* doc, Node *colgroup, GetTokenMode ARG_UNUS
     return NULL;
 }
 
+
+/** MARK: TY_(ParseTableTag)
+ *  Parses the `table` tag.
+ */
 void* TY_(ParseTableTag)(TidyDocImpl* doc, Node *table, GetTokenMode ARG_UNUSED(mode))
 {
 #if defined(ENABLE_DEBUG_LOG)
@@ -3094,21 +3067,10 @@ void* TY_(ParseTableTag)(TidyDocImpl* doc, Node *table, GetTokenMode ARG_UNUSED(
     return NULL;
 }
 
-/* acceptable content for pre elements */
-static Bool PreContent( TidyDocImpl* ARG_UNUSED(doc), Node* node )
-{
-    /* p is coerced to br's, Text OK too */
-    if ( nodeIsP(node) || TY_(nodeIsText)(node) )
-        return yes;
 
-    if ( node->tag == NULL ||
-         nodeIsPARAM(node) ||
-         !TY_(nodeHasCM)(node, CM_INLINE|CM_NEW) )
-        return no;
-
-    return yes;
-}
-
+/** MARK: TY_(ParsePre)
+ *  Parses the `pre` tag.
+ */
 void* TY_(ParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode) )
 {
     Node *node;
@@ -3284,6 +3246,10 @@ void* TY_(ParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode) 
     return NULL;
 }
 
+
+/** MARK: TY_(ParseOptGroup)
+ *  Parses the `optgroup` tag.
+ */
 void* TY_(ParseOptGroup)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode))
 {
     Lexer* lexer = doc->lexer;
@@ -3324,6 +3290,9 @@ void* TY_(ParseOptGroup)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(
 }
 
 
+/** MARK: TY_(ParseSelect)
+ *  Parses the `select` tag.
+ */
 void* TY_(ParseSelect)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode))
 {
 #if defined(ENABLE_DEBUG_LOG)
@@ -3381,7 +3350,10 @@ void* TY_(ParseSelect)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mo
     return NULL;
 }
 
-/* HTML5 */
+
+/** MARK: TY_(ParseDataList)
+ *  Parses the `datalist` tag.
+ */
 void* TY_(ParseDatalist)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode))
 {
 #if defined(ENABLE_DEBUG_LOG)
@@ -3440,8 +3412,9 @@ void* TY_(ParseDatalist)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(
 }
 
 
-
-
+/** MARK: TY_(ParseText)
+ *  Parses the `option` and `textarea` tags.
+ */
 void* TY_(ParseText)(TidyDocImpl* doc, Node *field, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
@@ -3511,6 +3484,9 @@ void* TY_(ParseText)(TidyDocImpl* doc, Node *field, GetTokenMode mode)
 }
 
 
+/** MARK: TY_(ParseTitle)
+ *  Parses the `title` tag.
+ */
 void* TY_(ParseTitle)(TidyDocImpl* doc, Node *title, GetTokenMode ARG_UNUSED(mode))
 {
     Node *node;
@@ -3571,13 +3547,18 @@ void* TY_(ParseTitle)(TidyDocImpl* doc, Node *title, GetTokenMode ARG_UNUSED(mod
     return NULL;
 }
 
-/*
-  This isn't quite right for CDATA content as it recognises
-  tags within the content and parses them accordingly.
-  This will unfortunately screw up scripts which include
-  < + letter,  < + !, < + ?  or  < + / + letter
-*/
 
+/** MARK: TY_(ParseScript)
+ *  Parses the `script` tag.
+ *
+ *  @todo This isn't quite right for CDATA content as it recognises tags
+ *  within the content and parses them accordingly. This will unfortunately
+ *  screw up scripts which include:
+ *    < + letter
+ *    < + !
+ *    < + ?
+ *    < + / + letter
+ */
 void* TY_(ParseScript)(TidyDocImpl* doc, Node *script, GetTokenMode ARG_UNUSED(mode))
 {
     Node *node;
@@ -3614,27 +3595,10 @@ void* TY_(ParseScript)(TidyDocImpl* doc, Node *script, GetTokenMode ARG_UNUSED(m
     return NULL;
 }
 
-Bool TY_(IsJavaScript)(Node *node)
-{
-    Bool result = no;
-    AttVal *attr;
 
-    if (node->attributes == NULL)
-        return yes;
-
-    for (attr = node->attributes; attr; attr = attr->next)
-    {
-        if ( (attrIsLANGUAGE(attr) || attrIsTYPE(attr))
-             && AttrContains(attr, "javascript") )
-        {
-            result = yes;
-            break;
-        }
-    }
-
-    return result;
-}
-
+/** MARK: TY_(ParseHead)
+ *  Parses the `head` tag.
+ */
 void* TY_(ParseHead)(TidyDocImpl* doc, Node *head, GetTokenMode ARG_UNUSED(mode))
 {
     Lexer* lexer = doc->lexer;
@@ -3750,47 +3714,10 @@ void* TY_(ParseHead)(TidyDocImpl* doc, Node *head, GetTokenMode ARG_UNUSED(mode)
     return NULL;
 }
 
-/*\ 
- *  Issue #166 - repeated <main> element
- *  But this service is generalised to check for other duplicate elements
-\*/
-Bool TY_(FindNodeWithId)( Node *node, TidyTagId tid )
-{
-    Node *content;
-    while (node)
-    {
-        if (TagIsId(node,tid))
-            return yes;
-        /*\ 
-         *   Issue #459 - Under certain circumstances, with many node this use of
-         *   'for (content = node->content; content; content = content->content)'
-         *   would produce a **forever** circle, or at least a very extended loop...
-         *   It is sufficient to test the content, if it exists,
-         *   to quickly iterate all nodes. Now all nodes are tested only once.
-        \*/ 
-        content = node->content;
-        if (content)
-        {
-            if (TY_(FindNodeWithId)(content,tid))
-                return yes;
-        }
-        node = node->next;
-    }
-    return no;
-}
 
-
-/*\ 
- *  Issue #166 - repeated <main> element
- *  Do a global search for an element
-\*/
-Bool TY_(FindNodeById)( TidyDocImpl* doc, TidyTagId tid )
-{
-    Node *node = (doc ? doc->root.content : NULL);
-    return TY_(FindNodeWithId)(node,tid);
-}
-
-
+/** MARK: TY_(ParseBody)
+ *  Parses the `body` tag.
+ */
 void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
@@ -3805,14 +3732,6 @@ void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
     DEBUG_LOG(SPRTF("Enter ParseBody...\n"));
     while ((node = TY_(GetToken)(doc, mode)) != NULL)
     {
-//        /* Execute our continuation. */
-//        if ( continuation && continuation->func )
-//        {
-//            continuation->func(continuation->doc, continuation->node, continuation->mode);
-//            continuation = NULL;
-//        }
-
-
         /* find and discard multiple <body> elements */
         if (node->tag == body->tag && node->type == StartTag)
         {
@@ -4022,11 +3941,12 @@ void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
 
         if (TY_(nodeIsElement)(node))
         {
-            if (nodeIsMAIN(node)) {
+            if (nodeIsMAIN(node))
+            {
                 /*\ Issue #166 - repeated <main> element
                  *  How to efficiently search for a previous main element?
                 \*/
-                if ( TY_(FindNodeById)(doc, TidyTag_MAIN) )
+                if ( findNodeById(doc, TidyTag_MAIN) )
                 {
                     doc->badForm |= flg_BadMain; /* this is an ERROR in format */
                     TY_(Report)(doc, body, node, DISCARDING_UNEXPECTED);
@@ -4078,6 +3998,10 @@ void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
     return NULL;
 }
 
+
+/** MARK: TY_(ParseNoFrames)
+ *  Parses the `noframes` tag.
+ */
 void* TY_(ParseNoFrames)(TidyDocImpl* doc, Node *noframes, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
@@ -4185,6 +4109,10 @@ void* TY_(ParseNoFrames)(TidyDocImpl* doc, Node *noframes, GetTokenMode mode)
     return NULL;
 }
 
+
+/** MARK: TY_(ParseFrameSet)
+ *  Parses the `frameset` tag.
+ */
 void* TY_(ParseFrameSet)(TidyDocImpl* doc, Node *frameset, GetTokenMode ARG_UNUSED(mode))
 {
     Lexer* lexer = doc->lexer;
@@ -4258,6 +4186,10 @@ void* TY_(ParseFrameSet)(TidyDocImpl* doc, Node *frameset, GetTokenMode ARG_UNUS
     return NULL;
 }
 
+
+/** MARK: TY_(ParseHTML)
+ *  Parses the `html` tag.
+ */
 void* TY_(ParseHTML)(TidyDocImpl* doc, Node *html, GetTokenMode mode)
 {
     Node *node, *head;
@@ -4494,11 +4426,15 @@ void* TY_(ParseHTML)(TidyDocImpl* doc, Node *html, GetTokenMode mode)
     return NULL;
 }
 
-static Bool nodeCMIsOnlyInline( Node* node )
-{
-    return TY_(nodeHasCM)( node, CM_INLINE ) && !TY_(nodeHasCM)( node, CM_BLOCK );
-}
 
+/***************************************************************************//*
+ ** MARK: - Post-Parse Operations
+ ***************************************************************************/
+
+
+/**
+ *  Encloses all naked body text within `p` tags.
+ */
 static void EncloseBodyText(TidyDocImpl* doc)
 {
     Node* node;
@@ -4530,9 +4466,13 @@ static void EncloseBodyText(TidyDocImpl* doc)
     }
 }
 
-/* <form>, <blockquote> and <noscript> do not allow #PCDATA in
-   HTML 4.01 Strict (%block; model instead of %flow;).
-  When requested, text nodes in these elements are wrapped in <p>. */
+
+/**
+ *  Encloses naked text in certain elements within `p` tags.
+ *
+ *  <form>, <blockquote>, and <noscript> do not allow #PCDATA in
+ *  HTML 4.01 Strict (%block; model instead of %flow;).
+ */
 static void EncloseBlockText(TidyDocImpl* doc, Node* node)
 {
     Node *next;
@@ -4576,6 +4516,10 @@ static void EncloseBlockText(TidyDocImpl* doc, Node* node)
     }
 }
 
+
+/**
+ *  Replaces elements that are obsolete with appropriate substitute tags.
+ */
 static void ReplaceObsoleteElements(TidyDocImpl* doc, Node* node)
 {
     Node *next;
@@ -4600,6 +4544,10 @@ static void ReplaceObsoleteElements(TidyDocImpl* doc, Node* node)
     }
 }
 
+
+/**
+ *  Performs checking of all attributes recursively starting at `node`.
+ */
 static void AttributeChecks(TidyDocImpl* doc, Node* node)
 {
     Node *next;
@@ -4624,9 +4572,315 @@ static void AttributeChecks(TidyDocImpl* doc, Node* node)
     }
 }
 
-/*
-  HTML is the top level element
-*/
+
+/***************************************************************************//*
+ ** MARK: - Internal API Implementation
+ ***************************************************************************/
+
+
+/**
+ *  Is used to perform a node integrity check after parsing an HTML or XML
+ *  document.
+ *  @note Actual performance of this check can be disabled by defining the
+ *  macro NO_NODE_INTEGRITY_CHECK.
+ */
+Bool TY_(CheckNodeIntegrity)(Node *node)
+{
+#ifndef NO_NODE_INTEGRITY_CHECK
+    Node *child;
+
+    if (node->prev)
+    {
+        if (node->prev->next != node)
+            return no;
+    }
+
+    if (node->next)
+    {
+        if (node->next == node || node->next->prev != node)
+            return no;
+    }
+
+    if (node->parent)
+    {
+        if (node->prev == NULL && node->parent->content != node)
+            return no;
+
+        if (node->next == NULL && node->parent->last != node)
+            return no;
+    }
+
+    for (child = node->content; child; child = child->next)
+        if ( child->parent != node || !TY_(CheckNodeIntegrity)(child) )
+            return no;
+
+#endif
+    return yes;
+}
+
+
+/**
+ *  Used to check if a node uses CM_NEW, which determines how attributes
+ *  without values should be printed. This was introduced to deal with
+ *  user-defined tags e.g. ColdFusion.
+ */
+Bool TY_(IsNewNode)(Node *node)
+{
+    if (node && node->tag)
+    {
+        return (node->tag->model & CM_NEW);
+    }
+    return yes;
+}
+
+
+/**
+ *  Transforms a given node to another element, for example, from a <p>
+ *  to a <br>.
+ */
+void TY_(CoerceNode)(TidyDocImpl* doc, Node *node, TidyTagId tid, Bool obsolete, Bool unexpected)
+{
+    const Dict* tag = TY_(LookupTagDef)(tid);
+    Node* tmp = TY_(InferredTag)(doc, tag->id);
+
+    if (obsolete)
+        TY_(Report)(doc, node, tmp, OBSOLETE_ELEMENT);
+    else if (unexpected)
+        TY_(Report)(doc, node, tmp, REPLACING_UNEX_ELEMENT);
+    else
+        TY_(Report)(doc, node, tmp, REPLACING_ELEMENT);
+
+    TidyDocFree(doc, tmp->element);
+    TidyDocFree(doc, tmp);
+
+    node->was = node->tag;
+    node->tag = tag;
+    node->type = StartTag;
+    node->implicit = yes;
+    TidyDocFree(doc, node->element);
+    node->element = TY_(tmbstrdup)(doc->allocator, tag->name);
+}
+
+
+/**
+ *  Extract a node and its children from a markup tree
+ */
+Node *TY_(RemoveNode)(Node *node)
+{
+    if (node->prev)
+        node->prev->next = node->next;
+
+    if (node->next)
+        node->next->prev = node->prev;
+
+    if (node->parent)
+    {
+        if (node->parent->content == node)
+            node->parent->content = node->next;
+
+        if (node->parent->last == node)
+            node->parent->last = node->prev;
+    }
+
+    node->parent = node->prev = node->next = NULL;
+    return node;
+}
+
+
+/**
+ *  Remove node from markup tree and discard it.
+ */
+Node *TY_(DiscardElement)( TidyDocImpl* doc, Node *element )
+{
+    Node *next = NULL;
+
+    if (element)
+    {
+        next = element->next;
+        TY_(RemoveNode)(element);
+        TY_(FreeNode)( doc, element);
+    }
+
+    return next;
+}
+
+
+/**
+ *  Insert node into markup tree as the firt element of content of element.
+ */
+void TY_(InsertNodeAtStart)(Node *element, Node *node)
+{
+    node->parent = element;
+
+    if (element->content == NULL)
+        element->last = node;
+    else
+        element->content->prev = node;
+
+    node->next = element->content;
+    node->prev = NULL;
+    element->content = node;
+}
+
+
+/**
+ *  Insert node into markup tree as the last element of content of element.
+ */
+void TY_(InsertNodeAtEnd)(Node *element, Node *node)
+{
+    node->parent = element;
+    node->prev = element->last;
+
+    if (element->last != NULL)
+        element->last->next = node;
+    else
+        element->content = node;
+
+    element->last = node;
+}
+
+
+/**
+ *  Insert node into markup tree before element.
+ */
+void TY_(InsertNodeBeforeElement)(Node *element, Node *node)
+{
+    Node *parent;
+
+    parent = element->parent;
+    node->parent = parent;
+    node->next = element;
+    node->prev = element->prev;
+    element->prev = node;
+
+    if (node->prev)
+        node->prev->next = node;
+
+    if (parent->content == element)
+        parent->content = node;
+}
+
+
+/**
+ *  Insert node into markup tree after element.
+ */
+void TY_(InsertNodeAfterElement)(Node *element, Node *node)
+{
+    Node *parent;
+
+    parent = element->parent;
+    node->parent = parent;
+
+    /* AQ - 13 Jan 2000 fix for parent == NULL */
+    if (parent != NULL && parent->last == element)
+        parent->last = node;
+    else
+    {
+        node->next = element->next;
+        /* AQ - 13 Jan 2000 fix for node->next == NULL */
+        if (node->next != NULL)
+            node->next->prev = node;
+    }
+
+    element->next = node;
+    node->prev = element;
+}
+
+
+/**
+ *  Trims a single, empty element, returning the next node.
+ */
+Node *TY_(TrimEmptyElement)( TidyDocImpl* doc, Node *element )
+{
+    if ( CanPrune(doc, element) )
+    {
+        if (element->type != TextNode)
+        {
+            doc->footnotes |= FN_TRIM_EMPTY_ELEMENT;
+            TY_(Report)(doc, element, NULL, TRIM_EMPTY_ELEMENT);
+        }
+
+        return TY_(DiscardElement)(doc, element);
+    }
+    return element->next;
+}
+
+
+/**
+ *  Trims a tree of empty elements recursively, returning the next node.
+ */
+Node* TY_(DropEmptyElements)(TidyDocImpl* doc, Node* node)
+{
+    Node* next;
+
+    while (node)
+    {
+        next = node->next;
+
+        if (node->content)
+            TY_(DropEmptyElements)(doc, node->content);
+
+        if (!TY_(nodeIsElement)(node) &&
+            !(TY_(nodeIsText)(node) && !(node->start < node->end)))
+        {
+            node = next;
+            continue;
+        }
+
+        next = TY_(TrimEmptyElement)(doc, node);
+        node = next;
+    }
+
+    return node;
+}
+
+
+/**
+ *  Indicates whether or not a text node is blank, meaning that it consists
+ *  of nothing, or a single space.
+ */
+Bool TY_(IsBlank)(Lexer *lexer, Node *node)
+{
+    Bool isBlank = TY_(nodeIsText)(node);
+    if ( isBlank )
+        isBlank = ( node->end == node->start ||       /* Zero length */
+                   ( node->end == node->start+1      /* or one blank. */
+                    && lexer->lexbuf[node->start] == ' ' ) );
+        return isBlank;
+}
+
+
+/**
+ *  Indicates whether or not a node is declared as containing javascript
+ *  code.
+ */
+Bool TY_(IsJavaScript)(Node *node)
+{
+    Bool result = no;
+    AttVal *attr;
+
+    if (node->attributes == NULL)
+        return yes;
+
+    for (attr = node->attributes; attr; attr = attr->next)
+    {
+        if ( (attrIsLANGUAGE(attr) || attrIsTYPE(attr))
+             && AttrContains(attr, "javascript") )
+        {
+            result = yes;
+            break;
+        }
+    }
+
+    return result;
+}
+
+
+/**
+ *  Parses an HTML document after lexing. It begins by properly configuring
+ *  the overall HTML structure, and subsequently processes all remaining
+ *  nodes.
+ */
 void TY_(ParseDocument)(TidyDocImpl* doc)
 {
     Node *node, *html, *doctype = NULL;
@@ -4763,6 +5017,11 @@ void TY_(ParseDocument)(TidyDocImpl* doc)
         EncloseBlockText(doc, &doc->root);
 }
 
+
+/**
+ *  Indicates whether or not whitespace is to be preserved in XHTML/XML
+ *  documents.
+ */
 Bool TY_(XMLPreserveWhiteSpace)( TidyDocImpl* doc, Node *element)
 {
     AttVal *attribute;
