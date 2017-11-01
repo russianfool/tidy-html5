@@ -4960,11 +4960,11 @@ void TY_(ParseDocument)(TidyDocImpl* doc)
             html = node;
 
         /*\
-         *  #72, avoid MISSING_DOCTYPE if show-body-only. 
+         *  #72, avoid MISSING_DOCTYPE if show-body-only.
          *  #191, also if --doctype omit, that is TidyDoctypeOmit
          *  #342, adjust tags to html4-- if not 'auto' or 'html5'
         \*/
-        if (!TY_(FindDocType)(doc)) 
+        if (!TY_(FindDocType)(doc))
         {
             ulong dtmode = cfg( doc, TidyDoctypeMode );
             if ((dtmode != TidyDoctypeOmit) && !showingBodyOnly(doc))
