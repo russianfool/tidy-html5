@@ -5225,9 +5225,9 @@ void TY_(ParseXMLDocument)(TidyDocImpl* doc)
  */
 typedef enum {
     STATE_PRE_HEAD,         /**< In this state, we've not detected head yet. */
-    STATE_PARSE_HEAD,       /**< In this state, we will setup head for parsing. */
     STATE_PRE_BODY,         /**< In this state, we'll consider frames vs. body. */
     STATE_PARSE_BODY,       /**< In this state, we can parse the body. */
+    STATE_PARSE_HEAD,       /**< In this state, we will setup head for parsing. */
     STATE_PARSE_NOFRAMES,   /**< In this state, we can parse noframes content. */
     STATE_PARSE_FRAMESET,   /**< In this state, we will parse frameset content. */
     STATE_COMPLETE,         /**< Complete! */
@@ -5330,20 +5330,6 @@ void* TY_(newParseHTML)( TidyDocImpl* doc, Node *html, GetTokenMode mode )
                 node = TY_(InferredTag)(doc, TidyTag_HEAD);
                 state = STATE_PARSE_HEAD;
                 keepToken = yes;
-                continue;
-            } break;
-
-
-            /**************************************************************
-             In this case, we're ready to parse the head, and move on to
-             look for the body or body alternative.
-             **************************************************************/
-            case STATE_PARSE_HEAD:
-            {
-                head = node;
-                TY_(InsertNodeAtEnd)(html, head);
-                ParseTag(doc, head, mode);
-                state = STATE_PRE_BODY;
                 continue;
             } break;
 
@@ -5528,6 +5514,20 @@ void* TY_(newParseHTML)( TidyDocImpl* doc, Node *html, GetTokenMode mode )
                 TY_(ConstrainVersion)(doc, ~VERS_FRAMESET);
                 state = STATE_PARSE_BODY;
                 keepToken = yes;
+                continue;
+            } break;
+
+
+            /**************************************************************
+             In this case, we're ready to parse the head, and move on to
+             look for the body or body alternative.
+             **************************************************************/
+            case STATE_PARSE_HEAD:
+            {
+                head = node;
+                TY_(InsertNodeAtEnd)(html, head);
+                ParseTag(doc, head, mode);
+                state = STATE_PRE_BODY;
                 continue;
             } break;
 
