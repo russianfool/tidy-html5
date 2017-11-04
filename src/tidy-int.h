@@ -64,7 +64,7 @@ struct _TidyDocImpl
     TidyConfigChangeCallback pConfigChangeCallback;
     TidyPPProgress           progressCallback;
 
-    TidyParserTrampoline     parseNext;
+    TidyParserStack          stack;
 
     /* Parse + Repair Results */
     uint                optionErrors;

@@ -42,16 +42,47 @@
 
 
 /**
- *  Trampoline structure to avoid parser recursion. Instead of recursion,
- *  we'll pass information back up to the calling function, avoiding
- *  running out of stack on ridiculous, stupid, broken HTML.
+ *  The parsers keeps track of their states with the states defined here.
  */
-typedef struct _TidyParserTrampoline {
-    void* func;        /**< The next function to execute; either Parser or ParseTag. */
-    TidyDocImpl* doc;  /**< The doc to pass to the next function. */
-    Node* node;        /**< Node to pass to next function. */
-    GetTokenMode mode; /**< Parsing mode to pass to next function. */
-} TidyParserTrampoline;
+typedef enum {
+    /* Universal states. */
+    STATE_INITIAL,          /**< This is the initial state for every parser. */
+    STATE_COMPLETE,         /**< Complete! */
+    /* ParseHTML states. */
+    STATE_PRE_HEAD,            /**< In this state, we've not detected head yet. */
+    STATE_PRE_BODY,            /**< In this state, we'll consider frames vs. body. */
+    STATE_PARSE_BODY,          /**< In this state, we can parse the body. */
+    STATE_PARSE_HEAD,          /**< In this state, we will setup head for parsing. */
+    STATE_PARSE_HEAD_DONE,     /**< Resume here after parsing head. */
+    STATE_PARSE_NOFRAMES,      /**< In this state, we can parse noframes content. */
+    STATE_PARSE_FRAMESET,      /**< In this state, we will parse frameset content. */
+    STATE_PARSE_FRAMESET_DONE, /**< We need to cleanup some things after parsing frameset. */
+} parserState;
+
+
+/**
+ * This typedef represents the state of a parser when it enters and exits.
+ */
+typedef struct _TidyParserMemory
+{
+    Parser       *identity;      /**< Which parser pushed this record? */
+    Node         *reentry_node;  /**< A node a parser might want to save. */
+    GetTokenMode reentry_mode;   /**< The mode to use for the next node. */
+    parserState  reentry_state;  /**< State to set during re-entry. */
+    GetTokenMode mode;           /**< The caller will peek at this value to get the correct mode. */
+} TidyParserMemory;
+
+
+/**
+ *  This typedef represents a stack of parserState.
+ */
+typedef struct _TidyParserStack
+{
+    TidyParserMemory* content;    /**< A state record. */
+    TidyAllocator* allocator;     /**< The allocator used for creating. */
+    uint size;                    /**< Current size of the stack. */
+    int top;                      /**< Top of the stack. */
+} TidyParserStack;
 
 
 /**
@@ -209,6 +240,18 @@ Bool TY_(XMLPreserveWhiteSpace)( TidyDocImpl* doc, Node *element );
  *  @param doc The Tidy document.
  */
 void TY_(ParseXMLDocument)( TidyDocImpl* doc );
+
+
+/**
+ *  Allocates and initializes the parser's stack.
+ */
+void TY_(InitParserStack)( TidyDocImpl* doc );
+
+
+/**
+ *  Frees the parser's stack when done.
+ */
+void TY_(FreeParserStack)( TidyDocImpl* doc );
 
 
 /** @} end parser_h group */
