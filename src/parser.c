@@ -20,7 +20,6 @@ static void* ParseTag( TidyDocImpl* doc, Node *node, GetTokenMode mode );
 
 #define USE_NEW
 #ifdef USE_NEW
-void* TY_(newParseHTML)( TidyDocImpl* doc, Node *html, GetTokenMode mode );
 #endif
 
 
@@ -4193,247 +4192,6 @@ void* TY_(ParseFrameSet)(TidyDocImpl* doc, Node *frameset, GetTokenMode ARG_UNUS
 }
 
 
-/** MARK: TY_(ParseHTML)
- *  Parses the `html` tag.
- */
-void* TY_(ParseHTML)(TidyDocImpl* doc, Node *html, GetTokenMode mode)
-{
-    Node *node, *head;
-    Node *frameset = NULL;
-    Node *noframes = NULL;
-
-    DEBUG_LOG(SPRTF("Entering ParseHTML...\n"));
-    TY_(SetOptionBool)( doc, TidyXmlTags, no );
-
-    for (;;)
-    {
-        node = TY_(GetToken)(doc, IgnoreWhitespace);
-
-        if (node == NULL)
-        {
-            node = TY_(InferredTag)(doc, TidyTag_HEAD);
-            break;
-        }
-
-        if ( nodeIsHEAD(node) )
-            break;
-
-        if (node->tag == html->tag && node->type == EndTag)
-        {
-            TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-            TY_(FreeNode)( doc, node);
-            continue;
-        }
-
-        /* find and discard multiple <html> elements */
-        if (node->tag == html->tag && node->type == StartTag)
-        {
-            TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-            TY_(FreeNode)(doc, node);
-            continue;
-        }
-
-        /* deal with comments etc. */
-        if (InsertMisc(html, node))
-            continue;
-
-        TY_(UngetToken)( doc );
-        node = TY_(InferredTag)(doc, TidyTag_HEAD);
-        break;
-    }
-
-    head = node;
-    TY_(InsertNodeAtEnd)(html, head);
-    TY_(ParseHead)(doc, head, mode);
-
-
-    for (;;)
-    {
-        node = TY_(GetToken)(doc, IgnoreWhitespace);
-
-        if (node == NULL)
-        {
-            if (frameset == NULL) /* implied body */
-            {
-                node = TY_(InferredTag)(doc, TidyTag_BODY);
-                TY_(InsertNodeAtEnd)(html, node);
-                TY_(ParseBody)(doc, node, mode);
-            }
-
-            DEBUG_LOG(SPRTF("Exit ParseHTML 1...\n"));
-            return NULL;
-        }
-
-        /* robustly handle html tags */
-        if (node->tag == html->tag)
-        {
-            if (node->type != StartTag && frameset == NULL)
-                TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-
-            TY_(FreeNode)( doc, node);
-            continue;
-        }
-
-        /* deal with comments etc. */
-        if (InsertMisc(html, node))
-            continue;
-
-        /* if frameset document coerce <body> to <noframes> */
-        if ( nodeIsBODY(node) )
-        {
-            if (node->type != StartTag)
-            {
-                TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                TY_(FreeNode)( doc, node);
-                continue;
-            }
-
-            if ( cfg(doc, TidyAccessibilityCheckLevel) == 0 )
-            {
-                if (frameset != NULL)
-                {
-                    TY_(UngetToken)( doc );
-
-                    if (noframes == NULL)
-                    {
-                        noframes = TY_(InferredTag)(doc, TidyTag_NOFRAMES);
-                        TY_(InsertNodeAtEnd)(frameset, noframes);
-                        TY_(Report)(doc, html, noframes, INSERTING_TAG);
-                    }
-                    else
-                    {
-                        if (noframes->type == StartEndTag)
-                            noframes->type = StartTag;
-                    }
-
-                    ParseTag(doc, noframes, mode);
-                    continue;
-                }
-            }
-
-            TY_(ConstrainVersion)(doc, ~VERS_FRAMESET);
-            break;  /* to parse body */
-        }
-
-        /* flag an error if we see more than one frameset */
-        if ( nodeIsFRAMESET(node) )
-        {
-            if (node->type != StartTag)
-            {
-                TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                TY_(FreeNode)( doc, node);
-                continue;
-            }
-
-            if (frameset != NULL)
-                TY_(Report)(doc, html, node, DUPLICATE_FRAMESET);
-            else
-                frameset = node;
-
-            TY_(InsertNodeAtEnd)(html, node);
-            ParseTag(doc, node, mode);
-
-            /*
-              see if it includes a noframes element so
-              that we can merge subsequent noframes elements
-            */
-
-            for (node = frameset->content; node; node = node->next)
-            {
-                if ( nodeIsNOFRAMES(node) )
-                    noframes = node;
-            }
-            continue;
-        }
-
-        /* if not a frameset document coerce <noframes> to <body> */
-        if ( nodeIsNOFRAMES(node) )
-        {
-            if (node->type != StartTag)
-            {
-                TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                TY_(FreeNode)( doc, node);
-                continue;
-            }
-
-            if (frameset == NULL)
-            {
-                TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                TY_(FreeNode)( doc, node);
-                node = TY_(InferredTag)(doc, TidyTag_BODY);
-                break;
-            }
-
-            if (noframes == NULL)
-            {
-                noframes = node;
-                TY_(InsertNodeAtEnd)(frameset, noframes);
-            }
-            else
-                TY_(FreeNode)( doc, node);
-
-            ParseTag(doc, noframes, mode);
-            continue;
-        }
-
-        if (TY_(nodeIsElement)(node))
-        {
-            if (node->tag && node->tag->model & CM_HEAD)
-            {
-                MoveToHead(doc, html, node);
-                continue;
-            }
-
-            /* discard illegal frame element following a frameset */
-            if ( frameset != NULL && nodeIsFRAME(node) )
-            {
-                TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                TY_(FreeNode)(doc, node);
-                continue;
-            }
-        }
-
-        TY_(UngetToken)( doc );
-
-        /* insert other content into noframes element */
-
-        if (frameset)
-        {
-            if (noframes == NULL)
-            {
-                noframes = TY_(InferredTag)(doc, TidyTag_NOFRAMES);
-                TY_(InsertNodeAtEnd)(frameset, noframes);
-            }
-            else
-            {
-                TY_(Report)(doc, html, node, NOFRAMES_CONTENT);
-                if (noframes->type == StartEndTag)
-                    noframes->type = StartTag;
-            }
-
-            TY_(ConstrainVersion)(doc, VERS_FRAMESET);
-            ParseTag(doc, noframes, mode);
-            continue;
-        }
-
-        node = TY_(InferredTag)(doc, TidyTag_BODY);
-        /* Issue #132 - disable inserting BODY tag warning
-           BUT only if NOT --show-body-only yes */
-        if (!showingBodyOnly(doc))
-            TY_(Report)(doc, html, node, INSERTING_TAG );
-        TY_(ConstrainVersion)(doc, ~VERS_FRAMESET);
-        break;
-    }
-
-    /* node must be body */
-
-    TY_(InsertNodeAtEnd)(html, node);
-    ParseTag(doc, node, mode);
-    DEBUG_LOG(SPRTF("Exit ParseHTML 2...\n"));
-    return NULL;
-}
-
-
 /***************************************************************************//*
  ** MARK: - Post-Parse Operations
  ***************************************************************************/
@@ -4986,11 +4744,8 @@ void TY_(ParseDocument)(TidyDocImpl* doc)
             }
         }
         TY_(InsertNodeAtEnd)( &doc->root, html);
-#ifdef USE_NEW
-        TY_(newParseHTML)( doc, html, IgnoreWhitespace );
-#else
-        TY_(ParseHTML)( doc, html, IgnoreWhitespace );
-#endif
+//        TY_(ParseHTML)( doc, html, IgnoreWhitespace );
+        ParseTag( doc, html, IgnoreWhitespace );
         break;
     }
 
@@ -5003,11 +4758,8 @@ void TY_(ParseDocument)(TidyDocImpl* doc)
         /* a later check should complain if <body> is empty */
         html = TY_(InferredTag)(doc, TidyTag_HTML);
         TY_(InsertNodeAtEnd)( &doc->root, html);
-#ifdef USE_NEW
-        TY_(newParseHTML)( doc, html, IgnoreWhitespace );
-#else
-        TY_(ParseHTML)( doc, html, IgnoreWhitespace );
-#endif
+//        TY_(ParseHTML)( doc, html, IgnoreWhitespace );
+        ParseTag( doc, html, IgnoreWhitespace );
     }
 
     if (!TY_(FindTITLE)(doc))
@@ -5244,7 +4996,7 @@ typedef enum {
  *  While this doesn't affect the console application significantly, it's
  *  not very nice when LibTidy crashes.
  */
-void* TY_(newParseHTML)( TidyDocImpl* doc, Node *html, GetTokenMode mode )
+void* TY_(ParseHTML)( TidyDocImpl* doc, Node *html, GetTokenMode mode )
 {
     Node *node = NULL;
     Node *head = NULL;

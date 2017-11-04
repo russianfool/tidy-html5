@@ -860,15 +860,6 @@ static tmbchar LastChar( tmbstr str )
     return 0;
 }
 
-/*
-   node->type is one of these:
-
-    #define TextNode    1
-    #define StartTag    2
-    #define EndTag      3
-    #define StartEndTag 4
-*/
-
 Lexer* TY_(NewLexer)( TidyDocImpl* doc )
 {
     Lexer* lexer = (Lexer*) TidyDocAlloc( doc, sizeof(Lexer) );
