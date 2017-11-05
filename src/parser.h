@@ -50,6 +50,8 @@ typedef enum {
     /* Universal states. */
     STATE_INITIAL,             /**< This is the initial state for every parser. */
     STATE_COMPLETE,            /**< Complete! */
+    STATE_PARSE_TAG,
+    STATE_PARSE_TAG_DONE,
     /* ParseHTML states. */
     STATE_PRE_HEAD,            /**< In this state, we've not detected head yet. */
     STATE_PRE_BODY,            /**< In this state, we'll consider frames vs. body. */
