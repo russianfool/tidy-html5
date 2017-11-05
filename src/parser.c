@@ -812,8 +812,7 @@ static Bool FindLastLI( Node *list, Node **lastli )
  */
 void TY_(InitParserStack)( TidyDocImpl* doc )
 {
-    uint default_size = 2;
-    /* TidyAlloc handles memory allocation failures, so assume ok. */
+    uint default_size = 16;
     TidyParserMemory *content = (TidyParserMemory *) TidyAlloc( doc->allocator, sizeof(TidyParserMemory) * default_size );
 
     doc->stack.content = content;
@@ -884,7 +883,8 @@ static FUNC_UNUSED TidyParserMemory peekMemory( TidyDocImpl* doc )
 
 
 /**
- *  Peek at the parser memory "mode" field.
+ *  Peek at the parser memory "mode" field. This is just a convenience
+ *  to avoid having to create a new struct instance in the caller.
  */
 static GetTokenMode peekMemoryMode( TidyDocImpl* doc )
 {
@@ -893,7 +893,8 @@ static GetTokenMode peekMemoryMode( TidyDocImpl* doc )
 
 
 /**
- *  Peek at the parser memory "identity" field.
+ *  Peek at the parser memory "identity" field. This is just a convenience
+ *  to avoid having to create a new struct instance in the caller.
  */
 static Parser* peekMemoryIdentity( TidyDocImpl* doc )
 {
@@ -962,7 +963,7 @@ static Parser* GetParserForNode( TidyDocImpl* doc, Node *node )
 
 /**
  *  Instantiates the correct parser for the given node. This is currently
- *  maintain ONLY until the legacy parsers have been ported, as this
+ *  maintained ONLY until the legacy parsers have been ported, as this
  *  introduces recursion when used.
  */
 static void ParseTag( TidyDocImpl* doc, Node *node, GetTokenMode mode )
@@ -979,68 +980,71 @@ static void ParseTag( TidyDocImpl* doc, Node *node, GetTokenMode mode )
  *  with the provided node, which generally should be the HTML node after the
  *  pre-HTML stuff is handled at a higher level.
  *
- *  This parser loops from the first available node to the last, and is
- *  compatible with the old recursive parsers during the transition.
+ *  This parser works cooperatively with compliant parsers to pass state
+ *  information back and forth in the TidyDocImpl's `stack`, which resides on
+ *  the heap and prevents recursion and stack exhaustion, and also works well
+ *  with the old-style parsers that do recurse.
  */
 void ParseHTMLWithNode( TidyDocImpl* doc, Node* node )
 {
     GetTokenMode mode = IgnoreWhitespace;
-    Bool keepToken = no;
     Parser* parser = NULL;
 
     /*
      This main loop is only extinguished when all of the parser tokens are
-     consumed. Although we do have some delegation to lower level stack frames,
-     this loop is the master loop for the entire lexer content.
+     consumed. Note that most of the parsers consume tokens as well, and
+     so what we're really doing here is managing parsers and preventing
+     recursion with cooperating parsers.
      */
-    do
+    while ( node )
     {
-        /* What do we do? */
         if ( (parser = GetParserForNode( doc, node )) )
         {
             if ( (node = parser( doc, node, mode, no )) )
             {
                 /*
                  When a parser returns a node, it means that we have
-                 to continue the loop, because it indicates that it's
-                 an instruction for nested processing.
+                 to continue the loop rather than moving on, because it
+                 indicates that the parser encountered a token it does not
+                 handle. It also tells us the correct GetTokenMode to use
+                 for it via the struct that it pushed:
                  */
                 mode = peekMemoryMode( doc );
                 continue;
             }
         }
 
-
         /*
-         If there's something on the stack, we need to handle that
-         before getting the next token.
+         If we've come this far, the parser has bottomed out, and won't be
+         going any deeper. Now we run back up the stack to close all of the
+         open elements and handle any parser post-processing that was needed.
+         Of course, other nodes might cause us to deepen the stack again, too.
          */
         if ( !isEmptyParserStack( doc ) )
         {
-            Parser* func = peekMemoryIdentity( doc );
-            if ( func )
+            if ( (parser = peekMemoryIdentity( doc )) )
             {
-                if ( (node = func( doc, NULL, 0, yes )) )
+                if ( (node = parser( doc, NULL, 0, yes )) )
+                {
+                    /* Another assignment from the parser. */
+                    mode = peekMemoryMode( doc );
                     continue;
+                }
             } else {
-                /* No function was defined, but there's an empty record. */
+                /*
+                 There's no identity in the stack (it was used to pass back
+                 a GetToken mode, and nothing else, so remove discard it.
+                 */
                 popMemory( doc );
             }
-
         }
 
-
-
-        /* We don't want to get the next token unless we're
-           done with this one. Using this flag is much quicker
-           than using `UngetToken()` every time we want to keep
-           the token.
+        /*
+         Assuming we've gotten this far, there's no more work to do and
+         so we can draw a nice, fresh token from the lexer.
          */
-        if ( !keepToken )
-            node = TY_(GetToken)( doc, mode );
-        keepToken = no;
-
-    } while ( node );
+       node = TY_(GetToken)( doc, mode );
+    }
 }
 
 
@@ -4409,6 +4413,10 @@ void* TY_(oldParseFrameSet)(TidyDocImpl* doc, Node *frameset, GetTokenMode ARG_U
  */
 Node* TY_(ParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool popStack )
 {
+#if defined(ENABLE_DEBUG_LOG)
+    static int in_parser = 0;
+    static int parser_cnt = 0;
+#endif
     Node *node = NULL;
     Node *head = NULL;
     Node *frameset = NULL;
@@ -4416,11 +4424,19 @@ Node* TY_(ParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool popS
     Bool keepToken = no;
     parserState state = STATE_INITIAL;
 
-    DEBUG_LOG(SPRTF("\nEntering NewParseHTML...\n\n"));
+#if defined(ENABLE_DEBUG_LOG)
+    in_parser++;
+    parser_cnt++;
+    DEBUG_LOG(SPRTF("***Entering ParseHTML - %d - %d\n", in_parser, parser_cnt));
+#endif
 
     TY_(SetOptionBool)( doc, TidyXmlTags, no );
 
-    /* We are re-entering to finish up some work. */
+    /*
+     If we're re-entering, then we need to setup from a previous state,
+     instead of starting fresh. We can pull what we need from the document's
+     stack.
+     */
     if ( popStack )
     {
         TidyParserMemory memory = popMemory( doc );
@@ -4431,14 +4447,14 @@ Node* TY_(ParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool popS
         keepToken = node != NULL;
     }
 
-    /* This main loop is only extinguished when all of the parser
-     tokens are consumed. Although we do have some delegation to
-     lower level stack frames, this loop is the master loop for
-     the entire lexer content.
+    /*
+     This main loop pulls tokens from the lexer until we're out of tokens,
+     or until there's no more work to do.
      */
     while ( state != STATE_COMPLETE )
     {
-        /* We don't want to get the next token unless we're
+        /*
+         We don't want to get the next token unless we're
          done with this one. Using this flag is much quicker
          than using `UngetToken()` every time we want to keep
          the token.
@@ -4456,7 +4472,8 @@ Node* TY_(ParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool popS
                  **************************************************************/
             case STATE_INITIAL:
             {
-                /* The only way we can possibly be here is if the lexer
+                /*
+                 The only way we can possibly be here is if the lexer
                  had nothing to give us. Thus we'll create our own
                  head, and set the signal to start parsing it.
                  */
@@ -4731,6 +4748,7 @@ Node* TY_(ParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool popS
                 memory.reentry_state = STATE_COMPLETE;
                 TY_(InsertNodeAtEnd)(html, node);
                 pushMemory( doc, memory );
+                DEBUG_LOG(SPRTF("***Exiting ParseHTML - %d - %d\n", in_parser, parser_cnt));
                 return node;
             } break;
 
@@ -4802,7 +4820,7 @@ Node* TY_(ParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool popS
         } /* switch */
     } /* while */
 
-    DEBUG_LOG(SPRTF("Exit newParseHTML 2...\n"));
+    DEBUG_LOG(SPRTF("***Exiting ParseHTML - %d - %d\n", in_parser, parser_cnt));
     return NULL;
 }
 

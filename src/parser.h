@@ -42,12 +42,14 @@
 
 
 /**
- *  The parsers keeps track of their states with the states defined here.
+ *  The parsers keeps track of their states with the states defined here, and
+ *  use these symbols when pushing to the stack so that they can later recreate
+ *  their environments when re-entered.
  */
 typedef enum {
     /* Universal states. */
-    STATE_INITIAL,          /**< This is the initial state for every parser. */
-    STATE_COMPLETE,         /**< Complete! */
+    STATE_INITIAL,             /**< This is the initial state for every parser. */
+    STATE_COMPLETE,            /**< Complete! */
     /* ParseHTML states. */
     STATE_PRE_HEAD,            /**< In this state, we've not detected head yet. */
     STATE_PRE_BODY,            /**< In this state, we'll consider frames vs. body. */
@@ -63,6 +65,9 @@ typedef enum {
 
 /**
  * This typedef represents the state of a parser when it enters and exits.
+ * When the parser needs to finish work on the way back up the stack, it will
+ * push one of these records to the stack, and it will pop a record from the
+ * stack upon re-entry.
  */
 typedef struct _TidyParserMemory
 {
@@ -76,7 +81,8 @@ typedef struct _TidyParserMemory
 
 
 /**
- *  This typedef represents a stack of parserState.
+ *  This typedef represents a stack of parserState. The Tidy document has its
+ *  own instance of this.
  */
 typedef struct _TidyParserStack
 {
@@ -85,6 +91,20 @@ typedef struct _TidyParserStack
     uint size;                    /**< Current size of the stack. */
     int top;                      /**< Top of the stack. */
 } TidyParserStack;
+
+
+/**
+ *  Allocates and initializes the parser's stack. TidyCreate will perform
+ *  this automatically.
+ */
+void TY_(InitParserStack)( TidyDocImpl* doc );
+
+
+/**
+ *  Frees the parser's stack when done. TidyRelease will perform this
+ *  automatically.
+ */
+void TY_(FreeParserStack)( TidyDocImpl* doc );
 
 
 /**
@@ -242,18 +262,6 @@ Bool TY_(XMLPreserveWhiteSpace)( TidyDocImpl* doc, Node *element );
  *  @param doc The Tidy document.
  */
 void TY_(ParseXMLDocument)( TidyDocImpl* doc );
-
-
-/**
- *  Allocates and initializes the parser's stack.
- */
-void TY_(InitParserStack)( TidyDocImpl* doc );
-
-
-/**
- *  Frees the parser's stack when done.
- */
-void TY_(FreeParserStack)( TidyDocImpl* doc );
 
 
 /** @} end parser_h group */
