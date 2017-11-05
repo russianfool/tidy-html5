@@ -21,8 +21,6 @@
 
 
 static void ParseTag( TidyDocImpl* doc, Node *node, GetTokenMode mode );
-void ParseHTMLWithNode( TidyDocImpl* doc, Node* html );
-Node* TY_(NewParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool popStack );
 
 
 /****************************************************************************//*
@@ -879,7 +877,7 @@ static void pushMemory( TidyDocImpl* doc, TidyParserMemory data )
 /**
  *  Peek at the parser memory.
  */
-static TidyParserMemory peekMemory( TidyDocImpl* doc )
+static FUNC_UNUSED TidyParserMemory peekMemory( TidyDocImpl* doc )
 {
     return doc->stack.content[doc->stack.top];
 }
@@ -920,7 +918,7 @@ static TidyParserMemory popMemory( TidyDocImpl* doc )
 
 
 /***************************************************************************//*
- ** MARK: - Parsers
+ ** MARK: - Parser Search and Instantiation
  ***************************************************************************/
 
 
@@ -928,7 +926,7 @@ static TidyParserMemory popMemory( TidyDocImpl* doc )
  *  Retrieves the correct parser for the given node, accounting for various
  *  conditions, and readies the lexer for parsing that node.
  */
-static oldParser* GetParserForNode( TidyDocImpl* doc, Node *node )
+static Parser* GetParserForNode( TidyDocImpl* doc, Node *node )
 {
     Lexer* lexer = doc->lexer;
 
@@ -963,377 +961,99 @@ static oldParser* GetParserForNode( TidyDocImpl* doc, Node *node )
 
 
 /**
- *  Instantiates the correct parser for the given node.
+ *  Instantiates the correct parser for the given node. This is currently
+ *  maintain ONLY until the legacy parsers have been ported, as this
+ *  introduces recursion when used.
  */
 static void ParseTag( TidyDocImpl* doc, Node *node, GetTokenMode mode )
 {
-    oldParser* parser = GetParserForNode( doc, node );
+    Parser* parser = GetParserForNode( doc, node );
 
     if ( parser )
-        (*parser)( doc, node, mode );
+        (*parser)( doc, node, mode, no );
 }
 
 
-/** MARK: TY_(ParseHTML)
- *  Parses the `html` tag. At this point, other root-level stuff (doctype,
- *  comments) are already set up, and the bulk of the parsing can be
- *  conducted from here as our nexus.
+/**
+ *  The main parser body will populate the document's document root starting
+ *  with the provided node, which generally should be the HTML node after the
+ *  pre-HTML stuff is handled at a higher level.
  *
- *  The main goal behind this "new" parser is to avoid recursion, which
- *  leads to nasty stack overflows on the more stupid of HTML documents.
- *  While this doesn't affect the console application significantly, it's
- *  not very nice when LibTidy crashes.
+ *  This parser loops from the first available node to the last, and is
+ *  compatible with the old recursive parsers during the transition.
  */
-void* TY_(ParseHTML)( TidyDocImpl* doc, Node *html, GetTokenMode mode )
+void ParseHTMLWithNode( TidyDocImpl* doc, Node* node )
 {
-    Node *node = NULL;
-    Node *head = NULL;
-    Node *frameset = NULL;
-    Node *noframes = NULL;
-    parserState state = STATE_PRE_HEAD;
+    GetTokenMode mode = IgnoreWhitespace;
     Bool keepToken = no;
+    Parser* parser = NULL;
 
-    DEBUG_LOG(SPRTF("\nEntering ParseHTML...\n\n"));
-
-    TY_(SetOptionBool)( doc, TidyXmlTags, no );
-
-    /* This main loop is only extinguished when all of the parser
-       tokens are consumed. Although we do have some delegation to
-       lower level stack frames, this loop is the master loop for
-       the entire lexer content.
+    /*
+     This main loop is only extinguished when all of the parser tokens are
+     consumed. Although we do have some delegation to lower level stack frames,
+     this loop is the master loop for the entire lexer content.
      */
-    while ( state != STATE_COMPLETE )
+    do
     {
+        /* What do we do? */
+        if ( (parser = GetParserForNode( doc, node )) )
+        {
+            if ( (node = parser( doc, node, mode, no )) )
+            {
+                /*
+                 When a parser returns a node, it means that we have
+                 to continue the loop, because it indicates that it's
+                 an instruction for nested processing.
+                 */
+                mode = peekMemoryMode( doc );
+                continue;
+            }
+        }
+
+
+        /*
+         If there's something on the stack, we need to handle that
+         before getting the next token.
+         */
+        if ( !isEmptyParserStack( doc ) )
+        {
+            Parser* func = peekMemoryIdentity( doc );
+            if ( func )
+            {
+                if ( (node = func( doc, NULL, 0, yes )) )
+                    continue;
+            } else {
+                /* No function was defined, but there's an empty record. */
+                popMemory( doc );
+            }
+
+        }
+
+
+
         /* We don't want to get the next token unless we're
            done with this one. Using this flag is much quicker
            than using `UngetToken()` every time we want to keep
            the token.
          */
         if ( !keepToken )
-            node = TY_(GetToken)( doc, IgnoreWhitespace );
+            node = TY_(GetToken)( doc, mode );
         keepToken = no;
 
-        switch ( state )
-        {
-            /**************************************************************
-             This case is all about finding a head tag and dealing with
-             cases were we don't, so that we can move on to parsing a head
-             tag.
-             **************************************************************/
-            case STATE_PRE_HEAD:
-            {
-                /* The only way we can possibly be here is if the lexer
-                   had nothing to give us. Thus we'll create our own
-                   head, and set the signal to start parsing it.
-                 */
-                if (node == NULL)
-                {
-                    node = TY_(InferredTag)(doc, TidyTag_HEAD);
-                    state = STATE_PARSE_HEAD;
-                    keepToken = yes;
-                    continue;
-                }
-
-                /* We found exactly what we expected: head. */
-                if ( nodeIsHEAD(node) )
-                {
-                    state = STATE_PARSE_HEAD;
-                    keepToken = yes;
-                    continue;
-                }
-
-                /* We did not expect to find an html closing tag here! */
-                if (node->tag == html->tag && node->type == EndTag)
-                {
-                    TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                    TY_(FreeNode)( doc, node);
-                    continue;
-                }
-
-                /* Find and discard multiple <html> elements. */
-                if (node->tag == html->tag && node->type == StartTag)
-                {
-                    TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                    TY_(FreeNode)(doc, node);
-                    continue;
-                }
-
-                /* Deal with comments etc. */
-                if (InsertMisc(html, node))
-                    continue;
-
-                /* At this point, we didn't find a head tag, so put the
-                   token back and create our own head tag, so we can
-                   move on.
-                 */
-                TY_(UngetToken)( doc );
-                node = TY_(InferredTag)(doc, TidyTag_HEAD);
-                state = STATE_PARSE_HEAD;
-                keepToken = yes;
-                continue;
-            } break;
-
-
-            /**************************************************************
-             This case determines whether we're dealing with body or
-             frameset + noframes, and sets things up accordingly.
-             **************************************************************/
-            case STATE_PRE_BODY:
-            {
-                if (node == NULL )
-                {
-                    if (frameset == NULL) /* Implied body. */
-                    {
-                        node = TY_(InferredTag)(doc, TidyTag_BODY);
-                        state = STATE_PARSE_BODY;
-                        keepToken = yes;
-                    } else {
-                        state = STATE_COMPLETE;
-                    }
-
-                    continue;
-                }
-
-                /* Robustly handle html tags. */
-                if (node->tag == html->tag)
-                {
-                    if (node->type != StartTag && frameset == NULL)
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-
-                    TY_(FreeNode)( doc, node);
-                    continue;
-                }
-
-                /* Deal with comments etc. */
-                if (InsertMisc(html, node))
-                    continue;
-
-                /* If frameset document, coerce <body> to <noframes> */
-                if ( nodeIsBODY(node) )
-                {
-                    if (node->type != StartTag)
-                    {
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                        TY_(FreeNode)( doc, node);
-                        continue;
-                    }
-
-                    if ( cfg(doc, TidyAccessibilityCheckLevel) == 0 )
-                    {
-                        if (frameset != NULL)
-                        {
-                            TY_(UngetToken)( doc );
-
-                            if (noframes == NULL)
-                            {
-                                noframes = TY_(InferredTag)(doc, TidyTag_NOFRAMES);
-                                TY_(InsertNodeAtEnd)(frameset, noframes);
-                                TY_(Report)(doc, html, noframes, INSERTING_TAG);
-                            }
-                            else
-                            {
-                                if (noframes->type == StartEndTag)
-                                    noframes->type = StartTag;
-                            }
-
-                            state = STATE_PARSE_NOFRAMES;
-                            keepToken = yes;
-                            continue;
-                        }
-                    }
-
-                    TY_(ConstrainVersion)(doc, ~VERS_FRAMESET);
-                    state = STATE_PARSE_BODY;
-                    keepToken = yes;
-                    continue;
-                }
-
-                /* Flag an error if we see more than one frameset. */
-                if ( nodeIsFRAMESET(node) )
-                {
-                    if (node->type != StartTag)
-                    {
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                        TY_(FreeNode)( doc, node);
-                        continue;
-                    }
-
-                    if (frameset != NULL)
-                        TY_(Report)(doc, html, node, DUPLICATE_FRAMESET);
-                    else
-                        frameset = node;
-
-                    state = STATE_PARSE_FRAMESET;
-                    keepToken = yes;
-                    continue;
-                }
-
-                /* If not a frameset document coerce <noframes> to <body>. */
-                if ( nodeIsNOFRAMES(node) )
-                {
-                    if (node->type != StartTag)
-                    {
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                        TY_(FreeNode)( doc, node);
-                        continue;
-                    }
-
-                    if (frameset == NULL)
-                    {
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                        TY_(FreeNode)( doc, node);
-                        node = TY_(InferredTag)(doc, TidyTag_BODY);
-                        state = STATE_PARSE_BODY;
-                        keepToken = yes;
-                        continue;
-                    }
-
-                    if (noframes == NULL)
-                    {
-                        noframes = node;
-                        TY_(InsertNodeAtEnd)(frameset, noframes);
-                        state = STATE_PARSE_NOFRAMES;
-                        keepToken = yes;
-                    }
-                    else
-                    {
-                        TY_(FreeNode)( doc, node);
-                    }
-
-                    continue;
-                }
-
-                /* Deal with some other element that we're not expecting. */
-                if (TY_(nodeIsElement)(node))
-                {
-                    if (node->tag && node->tag->model & CM_HEAD)
-                    {
-                        MoveToHead(doc, html, node);
-                        continue;
-                    }
-
-                    /* Discard illegal frame element following a frameset. */
-                    if ( frameset != NULL && nodeIsFRAME(node) )
-                    {
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                        TY_(FreeNode)(doc, node);
-                        continue;
-                    }
-                }
-
-                TY_(UngetToken)( doc );
-
-                /* Insert other content into noframes element. */
-                if (frameset)
-                {
-                    if (noframes == NULL)
-                    {
-                        noframes = TY_(InferredTag)(doc, TidyTag_NOFRAMES);
-                        TY_(InsertNodeAtEnd)(frameset, noframes);
-                    }
-                    else
-                    {
-                        TY_(Report)(doc, html, node, NOFRAMES_CONTENT);
-                        if (noframes->type == StartEndTag)
-                            noframes->type = StartTag;
-                    }
-
-                    TY_(ConstrainVersion)(doc, VERS_FRAMESET);
-                    state = STATE_PARSE_NOFRAMES;
-                    keepToken = yes;
-                    continue;
-                }
-
-                node = TY_(InferredTag)(doc, TidyTag_BODY);
-
-                /* Issue #132 - disable inserting BODY tag warning
-                   BUT only if NOT --show-body-only yes */
-                if (!showingBodyOnly(doc))
-                    TY_(Report)(doc, html, node, INSERTING_TAG );
-
-                TY_(ConstrainVersion)(doc, ~VERS_FRAMESET);
-                state = STATE_PARSE_BODY;
-                keepToken = yes;
-                continue;
-            } break;
-
-
-            /**************************************************************
-             In this case, we're ready to parse the head, and move on to
-             look for the body or body alternative.
-             **************************************************************/
-            case STATE_PARSE_HEAD:
-            {
-                head = node;
-                TY_(InsertNodeAtEnd)(html, head);
-                ParseTag(doc, head, mode);
-                state = STATE_PRE_BODY;
-            } break;
-
-
-            /**************************************************************
-             In this case, we can finally parse a body.
-             **************************************************************/
-            case STATE_PARSE_BODY:
-            {
-                TY_(InsertNodeAtEnd)(html, node);
-                ParseTag(doc, node, mode);
-                state = STATE_COMPLETE;
-            } break;
-
-
-            /**************************************************************
-             In this case, we will parse noframes. If necessary, the
-             node is already inserted in the proper spot.
-             **************************************************************/
-            case STATE_PARSE_NOFRAMES:
-            {
-                ParseTag(doc, noframes, mode);
-                state = STATE_PRE_BODY;
-            } break;
-
-
-            /**************************************************************
-             In this case, we parse the frameset, and look for noframes
-             content to merge later if necessary.
-             **************************************************************/
-            case STATE_PARSE_FRAMESET:
-            {
-                TY_(InsertNodeAtEnd)(html, node);
-                ParseTag(doc, node, mode);
-
-                /* See if it includes a noframes element so that
-                   we can merge subsequent noframes elements.
-                 */
-                for (node = frameset->content; node; node = node->next)
-                {
-                    if ( nodeIsNOFRAMES(node) )
-                        noframes = node;
-                }
-                state = STATE_PRE_BODY;
-            } break;
-
-
-            /**************************************************************
-             We really shouldn't get here, but if we do, finish nicely.
-             **************************************************************/
-            default:
-            {
-                state = STATE_COMPLETE;
-            }
-        } /* switch */
-    } /* while */
-
-    DEBUG_LOG(SPRTF("Exit ParseHTML 2...\n"));
-    return NULL;
+    } while ( node );
 }
 
 
-/** MARK: TY_(ParseBlock)
+/***************************************************************************//*
+ ** MARK: - Old Parsers
+ ***************************************************************************/
+
+
+/** MARK: TY_(oldParseBlock)
  *  `element` is a node created by the lexer upon seeing the start tag, or
  *  by the parser when the start tag is inferred
  */
-void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
+void* TY_(oldParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
 {
 #if defined(ENABLE_DEBUG_LOG)
     static int in_parse_block = 0;
@@ -1358,7 +1078,7 @@ void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
         return NULL;
     }
 
-    if ( nodeIsFORM(element) && 
+    if ( nodeIsFORM(element) &&
          DescendantOf(element, TidyTag_FORM) )
         TY_(Report)(doc, element, NULL, ILLEGAL_NESTING );
 
@@ -1393,7 +1113,7 @@ void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
     else if (mode == IgnoreWhitespace)
     {
         /* Issue #212 - Further fix in case ParseBlock() is called with 'IgnoreWhitespace'
-           when such a leading space may need to be inserted before this element to 
+           when such a leading space may need to be inserted before this element to
            preverve the browser view */
         mode = MixedContent;
     }
@@ -1455,7 +1175,7 @@ void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
             }
             else if (DescendantOf( element, node->tag->id ))
             {
-                /* 
+                /*
                   if this is the end tag for an ancestor element
                   then infer end tag for this element
                 */
@@ -1699,7 +1419,7 @@ void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
 
                 if ( !TY_(nodeHasCM)(element, CM_OPT) && !element->implicit )
                     TY_(Report)(doc, element, node, MISSING_ENDTAG_BEFORE );
-                
+
                 /* #521, warn on missing optional end-tags if not omitting them. */
                 if ( cfgBool( doc, TidyOmitOptionalTags ) == no && TY_(nodeHasCM)(element, CM_OPT) )
                     TY_(Report)(doc, element, node, MISSING_ENDTAG_OPTIONAL );
@@ -1740,7 +1460,7 @@ void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
                 else if ( TY_(nodeHasCM)(node, CM_TABLE) || TY_(nodeHasCM)(node, CM_ROW) )
                 {
                     /* http://tidy.sf.net/issue/1316307 */
-                    /* In exiled mode, return so table processing can 
+                    /* In exiled mode, return so table processing can
                        continue. */
                     if (lexer->exiled) {
 #if defined(ENABLE_DEBUG_LOG)
@@ -1784,7 +1504,7 @@ void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
          *  href: http://www.w3.org/TR/html-markup/a.html
          *  The interactive element a must not appear as a descendant of the a element.
         \*/
-        if ( nodeIsA(node) && !node->implicit && 
+        if ( nodeIsA(node) && !node->implicit &&
              (nodeIsA(element) || DescendantOf(element, TidyTag_A)) )
         {
             if (node->type != EndTag && node->attributes == NULL
@@ -1848,11 +1568,11 @@ void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
                 TrimSpaces( doc, element );
 
             TY_(InsertNodeAtEnd)(element, node);
-            
+
             if (node->implicit)
                 TY_(Report)(doc, element, node, INSERTING_TAG );
 
-            /* Issue #212 - WHY is this hard coded to 'IgnoreWhitespace' while an 
+            /* Issue #212 - WHY is this hard coded to 'IgnoreWhitespace' while an
                effort has been made above to set a 'MixedContent' mode in some cases?
                WHY IS THE 'mode' VARIABLE NOT USED HERE???? */
             ParseTag( doc, node, IgnoreWhitespace /*MixedContent*/ );
@@ -1889,13 +1609,13 @@ void* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode)
 }
 
 
-/** MARK: TY_(ParseNamespace)
+/** MARK: TY_(oldParseNamespace)
  *  Act as a generic XML (sub)tree parser: collect each node and add it
  *  to the DOM, without any further validation.
  *  @todo Add schema- or other-hierarchy-definition-based validation
  *    of the subtree here.
  */
-void* TY_(ParseNamespace)(TidyDocImpl* doc, Node *basenode, GetTokenMode mode)
+void* TY_(oldParseNamespace)(TidyDocImpl* doc, Node *basenode, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
     Node *node;
@@ -1994,7 +1714,7 @@ void* TY_(ParseNamespace)(TidyDocImpl* doc, Node *basenode, GetTokenMode mode)
         }
         else if (node->type == StartTag)
         {
-            /* #130 MathML attr and entity fix! 
+            /* #130 MathML attr and entity fix!
                care if it has attributes, and 'accidently' any of those attributes match known */
             for ( av = node->attributes; av; av = av->next )
             {
@@ -2006,7 +1726,7 @@ void* TY_(ParseNamespace)(TidyDocImpl* doc, Node *basenode, GetTokenMode mode)
         }
         else
         {
-            /* #130 MathML attr and entity fix! 
+            /* #130 MathML attr and entity fix!
                care if it has attributes, and 'accidently' any of those attributes match known */
             for ( av = node->attributes; av; av = av->next )
             {
@@ -2021,10 +1741,10 @@ void* TY_(ParseNamespace)(TidyDocImpl* doc, Node *basenode, GetTokenMode mode)
 }
 
 
-/** MARK: TY_(ParseInline)
+/** MARK: TY_(oldParseInline)
  *  Parse inline element nodes.
  */
-void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
+void* TY_(oldParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
 {
 #if defined(ENABLE_DEBUG_LOG)
     static int in_parse_inline = 0;
@@ -2052,7 +1772,7 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
      This test is carried out in PushInline and PopInline, see istack.c
 
      InlineDup(...) is not called for elements with a CM_MIXED (inline and
-     block) content model, e.g. <del> or <ins>, otherwise constructs like 
+     block) content model, e.g. <del> or <ins>, otherwise constructs like
 
        <p>111<a name='foo'>222<del>333</del>444</a>555</p>
        <p>111<span>222<del>333</del>444</span>555</p>
@@ -2093,7 +1813,7 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
              then move the font element inside the anchor since
              otherwise it won't alter the anchor text color
             */
-            if ( nodeIsFONT(element) && 
+            if ( nodeIsFONT(element) &&
                  element->content && element->content == element->last )
             {
                 Node *child = element->content;
@@ -2162,14 +1882,14 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
             if (node->attributes == NULL || element->attributes == NULL)
                 TY_(Report)(doc, element, node, NESTED_EMPHASIS);
         }
-        else if ( TY_(IsPushed)(doc, node) && node->type == StartTag && 
+        else if ( TY_(IsPushed)(doc, node) && node->type == StartTag &&
                   nodeIsQ(node) )
         {
             /*\
              * Issue #215 - such nested quotes are NOT a problem if HTML5, so
              * only issue this warning if NOT HTML5 mode.
             \*/
-            if (TY_(HTMLVersion)(doc) != HT50) 
+            if (TY_(HTMLVersion)(doc) != HT50)
             {
                 TY_(Report)(doc, element, node, NESTED_QUOTATION);
             }
@@ -2221,7 +1941,7 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
         if ( nodeIsP(node) &&
              node->type == StartTag &&
              ( (mode & Preformatted) ||
-               nodeIsDT(element) || 
+               nodeIsDT(element) ||
                DescendantOf(element, TidyTag_DT )
              )
            )
@@ -2241,7 +1961,7 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
         {
             TY_(ConstrainVersion)( doc, ~VERS_HTML40_STRICT );
             TY_(InsertNodeAtEnd)(element, node);
-            (*node->tag->parser)( doc, node, mode );
+            (*node->tag->parser)( doc, node, mode, no );
             continue;
         }
 
@@ -2380,7 +2100,7 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
         */
         /* #427827 - fix by Randy Waki and Bjoern Hoehrmann 23 Aug 00 */
         /* if (node->tag == doc->tags.tag_a && !node->implicit && TY_(IsPushed)(doc, node)) */
-        if ( nodeIsA(node) && !node->implicit && 
+        if ( nodeIsA(node) && !node->implicit &&
              (nodeIsA(element) || DescendantOf(element, TidyTag_A)) )
         {
             /* coerce <a> to </a> unless it has some attributes */
@@ -2509,7 +2229,7 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
         }
 
 
-        /* 
+        /*
           if this is the end tag for an ancestor element
           then infer end tag for this element
         */
@@ -2523,7 +2243,7 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
                     if (!(element->tag->model & CM_OPT) && !element->implicit)
                         TY_(Report)(doc, element, node, MISSING_ENDTAG_BEFORE);
 
-                    if( TY_(IsPushedLast)( doc, element, node ) ) 
+                    if( TY_(IsPushedLast)( doc, element, node ) )
                         TY_(PopInline)( doc, element );
                     TY_(UngetToken)( doc );
 
@@ -2540,7 +2260,7 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
         }
 
         /*\
-         *  block level tags end this element 
+         *  block level tags end this element
          *  Issue #333 - There seems an exception if the element is a 'span',
          *  and the node just collected is a 'meta'. The 'meta' can not have
          *  CM_INLINE added, nor can the 'span' have CM_MIXED added without
@@ -2611,7 +2331,7 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
             /* trim white space before <br> */
             if ( nodeIsBR(node) )
                 TrimSpaces(doc, element);
-            
+
             TY_(InsertNodeAtEnd)(element, node);
             ParseTag(doc, node, mode);
             continue;
@@ -2634,10 +2354,10 @@ void* TY_(ParseInline)( TidyDocImpl* doc, Node *element, GetTokenMode mode )
 }
 
 
-/** MARK: TY_(ParseEmpty)
+/** MARK: TY_(oldParseEmpty)
  *  Parse empty element nodes.
  */
-void* TY_(ParseEmpty)(TidyDocImpl* doc, Node *element, GetTokenMode mode)
+void* TY_(oldParseEmpty)(TidyDocImpl* doc, Node *element, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
     if ( lexer->isvoyager )
@@ -2660,10 +2380,10 @@ void* TY_(ParseEmpty)(TidyDocImpl* doc, Node *element, GetTokenMode mode)
 }
 
 
-/** MARK: TY_(ParseDefList)
+/** MARK: TY_(oldParseDefList)
  *  Parses the `dl` tag.
  */
-void* TY_(ParseDefList)(TidyDocImpl* doc, Node *list, GetTokenMode mode)
+void* TY_(oldParseDefList)(TidyDocImpl* doc, Node *list, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
     Node *node, *parent;
@@ -2700,7 +2420,7 @@ void* TY_(ParseDefList)(TidyDocImpl* doc, Node *list, GetTokenMode mode)
             continue;
         }
 
-        /* 
+        /*
           if this is the end tag for an ancestor element
           then infer end tag for this element
         */
@@ -2802,7 +2522,7 @@ void* TY_(ParseDefList)(TidyDocImpl* doc, Node *list, GetTokenMode mode)
             TY_(FreeNode)( doc, node);
             continue;
         }
-        
+
         /* node should be <DT> or <DD>*/
         TY_(InsertNodeAtEnd)(list, node);
         ParseTag( doc, node, IgnoreWhitespace);
@@ -2813,10 +2533,10 @@ void* TY_(ParseDefList)(TidyDocImpl* doc, Node *list, GetTokenMode mode)
 }
 
 
-/** MARK: TY_(ParseList)
+/** MARK: TY_(oldParseList)
  *  Parses list tags.
  */
-void* TY_(ParseList)(TidyDocImpl* doc, Node *list, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseList)(TidyDocImpl* doc, Node *list, GetTokenMode ARG_UNUSED(mode))
 {
 #if defined(ENABLE_DEBUG_LOG)
     static int in_parse_list = 0;
@@ -2880,7 +2600,7 @@ void* TY_(ParseList)(TidyDocImpl* doc, Node *list, GetTokenMode ARG_UNUSED(mode)
         }
 
 
-        /* 
+        /*
           if this is the end tag for an ancestor element
           then infer end tag for this element
         */
@@ -2966,9 +2686,9 @@ void* TY_(ParseList)(TidyDocImpl* doc, Node *list, GetTokenMode ARG_UNUSED(mode)
                 return NULL;
             }
             /* http://tidy.sf.net/issue/836462
-               If "list" is an unordered list, insert the next tag within 
-               the last <li> to preserve the numbering to match the visual 
-               rendering of most browsers. */    
+               If "list" is an unordered list, insert the next tag within
+               the last <li> to preserve the numbering to match the visual
+               rendering of most browsers. */
             if ( nodeIsOL(list) && FindLastLI(list, &lastli) )
             {
                 /* Create a node for error reporting */
@@ -2982,12 +2702,12 @@ void* TY_(ParseList)(TidyDocImpl* doc, Node *list, GetTokenMode ARG_UNUSED(mode)
                 /* Add an inferred <li> */
                 wasblock = TY_(nodeHasCM)(node,CM_BLOCK);
                 node = TY_(InferredTag)(doc, TidyTag_LI);
-                /* Add "display: inline" to avoid a blank line after <li> with 
+                /* Add "display: inline" to avoid a blank line after <li> with
                    Internet Explorer. See http://tidy.sf.net/issue/836462 */
                 TY_(AddStyleProperty)( doc, node,
                                        wasblock
                                        ? "list-style: none; display: inline"
-                                       : "list-style: none" 
+                                       : "list-style: none"
                                        );
                 TY_(Report)(doc, list, node, MISSING_STARTTAG );
                 TY_(InsertNodeAtEnd)(list,node);
@@ -3006,10 +2726,10 @@ void* TY_(ParseList)(TidyDocImpl* doc, Node *list, GetTokenMode ARG_UNUSED(mode)
 }
 
 
-/** MARK: TY_(ParseRow)
+/** MARK: TY_(oldParseRow)
  *  Parses the `row` tag.
  */
-void* TY_(ParseRow)(TidyDocImpl* doc, Node *row, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseRow)(TidyDocImpl* doc, Node *row, GetTokenMode ARG_UNUSED(mode))
 {
     Lexer* lexer = doc->lexer;
     Node *node;
@@ -3036,7 +2756,7 @@ void* TY_(ParseRow)(TidyDocImpl* doc, Node *row, GetTokenMode ARG_UNUSED(mode))
             return NULL;
         }
 
-        /* 
+        /*
           if this is the end tag for an ancestor element
           then infer end tag for this element
         */
@@ -3144,7 +2864,7 @@ void* TY_(ParseRow)(TidyDocImpl* doc, Node *row, GetTokenMode ARG_UNUSED(mode))
             TY_(FreeNode)( doc, node);
             continue;
         }
-        
+
         /* node should be <TD> or <TH> */
         TY_(InsertNodeAtEnd)(row, node);
         exclude_state = lexer->excludeBlocks;
@@ -3161,10 +2881,10 @@ void* TY_(ParseRow)(TidyDocImpl* doc, Node *row, GetTokenMode ARG_UNUSED(mode))
 }
 
 
-/** MARK: TY_(ParseRowGroup)
+/** MARK: TY_(oldParseRowGroup)
  *  Parses the `rowgroup` tag.
  */
-void* TY_(ParseRowGroup)(TidyDocImpl* doc, Node *rowgroup, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseRowGroup)(TidyDocImpl* doc, Node *rowgroup, GetTokenMode ARG_UNUSED(mode))
 {
     Lexer* lexer = doc->lexer;
     Node *node, *parent;
@@ -3241,7 +2961,7 @@ void* TY_(ParseRowGroup)(TidyDocImpl* doc, Node *rowgroup, GetTokenMode ARG_UNUS
             }
         }
 
-        /* 
+        /*
           if this is the end tag for ancestor element
           then infer end tag for this element
         */
@@ -3295,7 +3015,7 @@ void* TY_(ParseRowGroup)(TidyDocImpl* doc, Node *rowgroup, GetTokenMode ARG_UNUS
             TY_(FreeNode)( doc, node);
             continue;
         }
-        
+
         if ( !nodeIsTR(node) )
         {
             node = TY_(InferredTag)(doc, TidyTag_TR);
@@ -3311,10 +3031,10 @@ void* TY_(ParseRowGroup)(TidyDocImpl* doc, Node *rowgroup, GetTokenMode ARG_UNUS
 }
 
 
-/** MARK: TY_(ParseColGroup)
+/** MARK: TY_(oldParseColGroup)
  *  Parses the `colgroup` tag.
  */
-void* TY_(ParseColGroup)(TidyDocImpl* doc, Node *colgroup, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseColGroup)(TidyDocImpl* doc, Node *colgroup, GetTokenMode ARG_UNUSED(mode))
 {
     Node *node, *parent;
 
@@ -3330,7 +3050,7 @@ void* TY_(ParseColGroup)(TidyDocImpl* doc, Node *colgroup, GetTokenMode ARG_UNUS
             return NULL;
         }
 
-        /* 
+        /*
           if this is the end tag for an ancestor element
           then infer end tag for this element
         */
@@ -3386,7 +3106,7 @@ void* TY_(ParseColGroup)(TidyDocImpl* doc, Node *colgroup, GetTokenMode ARG_UNUS
             TY_(FreeNode)( doc, node);
             continue;
         }
-        
+
         /* node should be <COL> */
         TY_(InsertNodeAtEnd)(colgroup, node);
         ParseTag(doc, node, IgnoreWhitespace);
@@ -3395,10 +3115,10 @@ void* TY_(ParseColGroup)(TidyDocImpl* doc, Node *colgroup, GetTokenMode ARG_UNUS
 }
 
 
-/** MARK: TY_(ParseTableTag)
+/** MARK: TY_(oldParseTableTag)
  *  Parses the `table` tag.
  */
-void* TY_(ParseTableTag)(TidyDocImpl* doc, Node *table, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseTableTag)(TidyDocImpl* doc, Node *table, GetTokenMode ARG_UNUSED(mode))
 {
 #if defined(ENABLE_DEBUG_LOG)
     static int in_parse_table = 0;
@@ -3414,7 +3134,7 @@ void* TY_(ParseTableTag)(TidyDocImpl* doc, Node *table, GetTokenMode ARG_UNUSED(
     in_parse_table++;
     SPRTF("Entering ParseTableTag %d...\n",in_parse_table);
 #endif
-    
+
     while ((node = TY_(GetToken)(doc, IgnoreWhitespace)) != NULL)
     {
         if (node->tag == table->tag )
@@ -3426,7 +3146,7 @@ void* TY_(ParseTableTag)(TidyDocImpl* doc, Node *table, GetTokenMode ARG_UNUSED(
             else
             {
                 /* Issue #498 - If a <table> in a <table>
-                 * just close the current table, and issue a 
+                 * just close the current table, and issue a
                  * warning. The previous action was to discard
                  * this second <table>
                  */
@@ -3470,7 +3190,7 @@ void* TY_(ParseTableTag)(TidyDocImpl* doc, Node *table, GetTokenMode ARG_UNUSED(
                 TY_(Report)(doc, table, node, TAG_NOT_ALLOWED_IN);
                 lexer->exiled = yes;
 
-                if (node->type != TextNode) 
+                if (node->type != TextNode)
                     ParseTag(doc, node, IgnoreWhitespace);
 
                 lexer->exiled = no;
@@ -3483,7 +3203,7 @@ void* TY_(ParseTableTag)(TidyDocImpl* doc, Node *table, GetTokenMode ARG_UNUSED(
             }
         }
 
-        /* 
+        /*
           if this is the end tag for an ancestor element
           then infer end tag for this element
         */
@@ -3558,10 +3278,10 @@ void* TY_(ParseTableTag)(TidyDocImpl* doc, Node *table, GetTokenMode ARG_UNUSED(
 }
 
 
-/** MARK: TY_(ParsePre)
+/** MARK: TY_(oldParsePre)
  *  Parses the `pre` tag.
  */
-void* TY_(ParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode) )
+void* TY_(oldParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode) )
 {
     Node *node;
 
@@ -3572,7 +3292,7 @@ void* TY_(ParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode) 
 
     while ((node = TY_(GetToken)(doc, Preformatted)) != NULL)
     {
-        if ( node->type == EndTag && 
+        if ( node->type == EndTag &&
              (node->tag == pre->tag || DescendantOf(pre, TagId(node))) )
         {
             if (nodeIsBODY(node) || nodeIsHTML(node))
@@ -3620,7 +3340,7 @@ void* TY_(ParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode) 
             /* fix for http://tidy.sf.net/bug/772205 */
             if (node->type == EndTag)
             {
-                /* http://tidy.sf.net/issue/1590220 */ 
+                /* http://tidy.sf.net/issue/1590220 */
                if ( doc->lexer->exiled
                    && (TY_(nodeHasCM)(node, CM_TABLE) || nodeIsTABLE(node)) )
                {
@@ -3671,7 +3391,7 @@ void* TY_(ParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode) 
                 <pre>...<br>...<br>...</pre>         (Internet Explorer)
                 <pre>...<br><br>...<br><br>...</pre> (Mozilla, Opera 6)
                 <pre>...<br>...<br><br>...</pre>     (Opera 7)
-                
+
               or something similar, they could also be closing the <pre> and propagate
               the <pre> into the newly opened <p>.
 
@@ -3702,7 +3422,7 @@ void* TY_(ParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode) 
 
                 /* trim white space before <p> in <pre>*/
                 TrimSpaces(doc, pre);
-            
+
                 /* coerce both <p> and </p> to <br> */
                 TY_(CoerceNode)(doc, node, TidyTag_BR, no, no);
                 TY_(FreeAttrs)( doc, node ); /* discard align attribute etc. */
@@ -3721,7 +3441,7 @@ void* TY_(ParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode) 
             /* trim white space before <br> */
             if ( nodeIsBR(node) )
                 TrimSpaces(doc, pre);
-            
+
             TY_(InsertNodeAtEnd)(pre, node);
             ParseTag(doc, node, Preformatted);
             continue;
@@ -3737,10 +3457,10 @@ void* TY_(ParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode) 
 }
 
 
-/** MARK: TY_(ParseOptGroup)
+/** MARK: TY_(oldParseOptGroup)
  *  Parses the `optgroup` tag.
  */
-void* TY_(ParseOptGroup)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseOptGroup)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode))
 {
     Lexer* lexer = doc->lexer;
     Node *node;
@@ -3761,7 +3481,7 @@ void* TY_(ParseOptGroup)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(
         if (InsertMisc(field, node))
             continue;
 
-        if ( node->type == StartTag && 
+        if ( node->type == StartTag &&
              (nodeIsOPTION(node) || nodeIsOPTGROUP(node)) )
         {
             if ( nodeIsOPTGROUP(node) )
@@ -3780,10 +3500,10 @@ void* TY_(ParseOptGroup)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(
 }
 
 
-/** MARK: TY_(ParseSelect)
+/** MARK: TY_(oldParseSelect)
  *  Parses the `select` tag.
  */
-void* TY_(ParseSelect)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseSelect)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode))
 {
 #if defined(ENABLE_DEBUG_LOG)
     static int in_parse_select = 0;
@@ -3815,11 +3535,11 @@ void* TY_(ParseSelect)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mo
         if (InsertMisc(field, node))
             continue;
 
-        if ( node->type == StartTag && 
+        if ( node->type == StartTag &&
              ( nodeIsOPTION(node)   ||
                nodeIsOPTGROUP(node) ||
                nodeIsDATALIST(node) ||
-               nodeIsSCRIPT(node)) 
+               nodeIsSCRIPT(node))
            )
         {
             TY_(InsertNodeAtEnd)(field, node);
@@ -3841,10 +3561,10 @@ void* TY_(ParseSelect)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mo
 }
 
 
-/** MARK: TY_(ParseDataList)
+/** MARK: TY_(oldParseDataList)
  *  Parses the `datalist` tag.
  */
-void* TY_(ParseDatalist)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseDatalist)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode))
 {
 #if defined(ENABLE_DEBUG_LOG)
     static int in_parse_datalist = 0;
@@ -3876,11 +3596,11 @@ void* TY_(ParseDatalist)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(
         if (InsertMisc(field, node))
             continue;
 
-        if ( node->type == StartTag && 
+        if ( node->type == StartTag &&
              ( nodeIsOPTION(node)   ||
                nodeIsOPTGROUP(node) ||
                nodeIsDATALIST(node) ||
-               nodeIsSCRIPT(node)) 
+               nodeIsSCRIPT(node))
            )
         {
             TY_(InsertNodeAtEnd)(field, node);
@@ -3902,10 +3622,10 @@ void* TY_(ParseDatalist)(TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(
 }
 
 
-/** MARK: TY_(ParseText)
+/** MARK: TY_(oldParseText)
  *  Parses the `option` and `textarea` tags.
  */
-void* TY_(ParseText)(TidyDocImpl* doc, Node *field, GetTokenMode mode)
+void* TY_(oldParseText)(TidyDocImpl* doc, Node *field, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
     Node *node;
@@ -3950,7 +3670,7 @@ void* TY_(ParseText)(TidyDocImpl* doc, Node *field, GetTokenMode mode)
         /* for textarea should all cases of < and & be escaped? */
 
         /* discard inline tags e.g. font */
-        if (   node->tag 
+        if (   node->tag
             && node->tag->model & CM_INLINE
             && !(node->tag->model & CM_FIELD)) /* #487283 - fix by Lee Passey 25 Jan 02 */
         {
@@ -3974,10 +3694,10 @@ void* TY_(ParseText)(TidyDocImpl* doc, Node *field, GetTokenMode mode)
 }
 
 
-/** MARK: TY_(ParseTitle)
+/** MARK: TY_(oldParseTitle)
  *  Parses the `title` tag.
  */
-void* TY_(ParseTitle)(TidyDocImpl* doc, Node *title, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseTitle)(TidyDocImpl* doc, Node *title, GetTokenMode ARG_UNUSED(mode))
 {
     Node *node;
     while ((node = TY_(GetToken)(doc, MixedContent)) != NULL)
@@ -4038,7 +3758,7 @@ void* TY_(ParseTitle)(TidyDocImpl* doc, Node *title, GetTokenMode ARG_UNUSED(mod
 }
 
 
-/** MARK: TY_(ParseScript)
+/** MARK: TY_(oldParseScript)
  *  Parses the `script` tag.
  *
  *  @todo This isn't quite right for CDATA content as it recognises tags
@@ -4049,10 +3769,10 @@ void* TY_(ParseTitle)(TidyDocImpl* doc, Node *title, GetTokenMode ARG_UNUSED(mod
  *    < + ?
  *    < + / + letter
  */
-void* TY_(ParseScript)(TidyDocImpl* doc, Node *script, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseScript)(TidyDocImpl* doc, Node *script, GetTokenMode ARG_UNUSED(mode))
 {
     Node *node;
-    
+
     doc->lexer->parent = script;
     node = TY_(GetToken)(doc, CdataContent);
     doc->lexer->parent = NULL;
@@ -4086,10 +3806,10 @@ void* TY_(ParseScript)(TidyDocImpl* doc, Node *script, GetTokenMode ARG_UNUSED(m
 }
 
 
-/** MARK: TY_(ParseHead)
+/** MARK: TY_(oldParseHead)
  *  Parses the `head` tag.
  */
-void* TY_(ParseHead)(TidyDocImpl* doc, Node *head, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseHead)(TidyDocImpl* doc, Node *head, GetTokenMode ARG_UNUSED(mode))
 {
     Lexer* lexer = doc->lexer;
     Node *node;
@@ -4155,7 +3875,7 @@ void* TY_(ParseHead)(TidyDocImpl* doc, Node *head, GetTokenMode ARG_UNUSED(mode)
             TY_(FreeNode)( doc, node);
             continue;
         }
-        
+
         /*
          if it doesn't belong in the head then
          treat as implicit end of head and deal
@@ -4205,10 +3925,10 @@ void* TY_(ParseHead)(TidyDocImpl* doc, Node *head, GetTokenMode ARG_UNUSED(mode)
 }
 
 
-/** MARK: TY_(ParseBody)
+/** MARK: TY_(oldParseBody)
  *  Parses the `body` tag.
  */
-void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
+void* TY_(oldParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
     Node *node;
@@ -4233,7 +3953,7 @@ void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
         /* #538536 Extra endtags not detected */
         if ( nodeIsHTML(node) )
         {
-            if (TY_(nodeIsElement)(node) || lexer->seenEndHtml) 
+            if (TY_(nodeIsElement)(node) || lexer->seenEndHtml)
                 TY_(Report)(doc, body, node, DISCARDING_UNEXPECTED);
             else
                 lexer->seenEndHtml = 1;
@@ -4242,7 +3962,7 @@ void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
             continue;
         }
 
-        if ( lexer->seenEndBody && 
+        if ( lexer->seenEndBody &&
              ( node->type == StartTag ||
                node->type == EndTag   ||
                node->type == StartEndTag ) )
@@ -4269,7 +3989,7 @@ void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
             if (node->type == StartTag)
             {
                 TY_(InsertNodeAtEnd)(body, node);
-                TY_(ParseBlock)(doc, node, mode);
+                TY_(oldParseBlock)(doc, node, mode);
                 continue;
             }
 
@@ -4288,7 +4008,7 @@ void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
             TY_(UngetToken)( doc );
             break;
         }
-        
+
         iswhitenode = no;
 
         if ( TY_(nodeIsText)(node) &&
@@ -4345,7 +4065,7 @@ void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
           to match Netscape's observed behaviour.
         */
         lexer->excludeBlocks = no;
-        
+
         if (( nodeIsINPUT(node) ||
              (!TY_(nodeHasCM)(node, CM_BLOCK) && !TY_(nodeHasCM)(node, CM_INLINE))
            ) && !TY_(IsHTML5Mode)(doc) )
@@ -4357,7 +4077,7 @@ void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
             if (node->tag->model & CM_HTML)
             {
                 /* copy body attributes if current body was inferred */
-                if ( nodeIsBODY(node) && body->implicit 
+                if ( nodeIsBODY(node) && body->implicit
                      && body->attributes == NULL )
                 {
                     body->attributes = node->attributes;
@@ -4489,10 +4209,10 @@ void* TY_(ParseBody)(TidyDocImpl* doc, Node *body, GetTokenMode mode)
 }
 
 
-/** MARK: TY_(ParseNoFrames)
+/** MARK: TY_(oldParseNoFrames)
  *  Parses the `noframes` tag.
  */
-void* TY_(ParseNoFrames)(TidyDocImpl* doc, Node *noframes, GetTokenMode mode)
+void* TY_(oldParseNoFrames)(TidyDocImpl* doc, Node *noframes, GetTokenMode mode)
 {
     Lexer* lexer = doc->lexer;
     Node *node;
@@ -4600,10 +4320,10 @@ void* TY_(ParseNoFrames)(TidyDocImpl* doc, Node *noframes, GetTokenMode mode)
 }
 
 
-/** MARK: TY_(ParseFrameSet)
+/** MARK: TY_(oldParseFrameSet)
  *  Parses the `frameset` tag.
  */
-void* TY_(ParseFrameSet)(TidyDocImpl* doc, Node *frameset, GetTokenMode ARG_UNUSED(mode))
+void* TY_(oldParseFrameSet)(TidyDocImpl* doc, Node *frameset, GetTokenMode ARG_UNUSED(mode))
 {
     Lexer* lexer = doc->lexer;
     Node *node;
@@ -4612,7 +4332,7 @@ void* TY_(ParseFrameSet)(TidyDocImpl* doc, Node *frameset, GetTokenMode ARG_UNUS
     {
         doc->badAccess |= BA_USING_FRAMES;
     }
-    
+
     while ((node = TY_(GetToken)(doc, IgnoreWhitespace)) != NULL)
     {
         if (node->tag == frameset->tag && node->type == EndTag)
@@ -4631,7 +4351,7 @@ void* TY_(ParseFrameSet)(TidyDocImpl* doc, Node *frameset, GetTokenMode ARG_UNUS
         {
             TY_(Report)(doc, frameset, node, DISCARDING_UNEXPECTED);
             TY_(FreeNode)( doc, node);
-            continue; 
+            continue;
         }
 
         if (TY_(nodeIsElement)(node))
@@ -4675,6 +4395,639 @@ void* TY_(ParseFrameSet)(TidyDocImpl* doc, Node *frameset, GetTokenMode ARG_UNUS
     TY_(Report)(doc, frameset, node, MISSING_ENDTAG_FOR);
     return NULL;
 }
+
+
+/***************************************************************************//*
+ ** MARK: - Parsers
+ ***************************************************************************/
+
+
+/** MARK: TY_(ParseHTML)
+ *  Parses the `html` tag. At this point, other root-level stuff (doctype,
+ *  comments) are already set up, and the bulk of the parsing can be
+ *  conducted from here as our nexus.
+ */
+Node* TY_(ParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool popStack )
+{
+    Node *node = NULL;
+    Node *head = NULL;
+    Node *frameset = NULL;
+    Node *noframes = NULL;
+    Bool keepToken = no;
+    parserState state = STATE_INITIAL;
+
+    DEBUG_LOG(SPRTF("\nEntering NewParseHTML...\n\n"));
+
+    TY_(SetOptionBool)( doc, TidyXmlTags, no );
+
+    /* We are re-entering to finish up some work. */
+    if ( popStack )
+    {
+        TidyParserMemory memory = popMemory( doc );
+        node = memory.reentry_node;
+        mode = memory.reentry_mode;
+        state = memory.reentry_state;
+        html = memory.original_node;
+        keepToken = node != NULL;
+    }
+
+    /* This main loop is only extinguished when all of the parser
+     tokens are consumed. Although we do have some delegation to
+     lower level stack frames, this loop is the master loop for
+     the entire lexer content.
+     */
+    while ( state != STATE_COMPLETE )
+    {
+        /* We don't want to get the next token unless we're
+         done with this one. Using this flag is much quicker
+         than using `UngetToken()` every time we want to keep
+         the token.
+         */
+        if ( !keepToken )
+            node = TY_(GetToken)( doc, IgnoreWhitespace );
+        keepToken = no;
+
+        switch ( state )
+        {
+                /**************************************************************
+                 This case is all about finding a head tag and dealing with
+                 cases were we don't, so that we can move on to parsing a head
+                 tag.
+                 **************************************************************/
+            case STATE_INITIAL:
+            {
+                /* The only way we can possibly be here is if the lexer
+                 had nothing to give us. Thus we'll create our own
+                 head, and set the signal to start parsing it.
+                 */
+                if (node == NULL)
+                {
+                    node = TY_(InferredTag)(doc, TidyTag_HEAD);
+                    state = STATE_PARSE_HEAD;
+                    keepToken = yes;
+                    continue;
+                }
+
+                /* We found exactly what we expected: head. */
+                if ( nodeIsHEAD(node) )
+                {
+                    state = STATE_PARSE_HEAD;
+                    keepToken = yes;
+                    continue;
+                }
+
+                /* We did not expect to find an html closing tag here! */
+                if (node->tag == html->tag && node->type == EndTag)
+                {
+                    TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
+                    TY_(FreeNode)( doc, node);
+                    continue;
+                }
+
+                /* Find and discard multiple <html> elements. */
+                if (node->tag == html->tag && node->type == StartTag)
+                {
+                    TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
+                    TY_(FreeNode)(doc, node);
+                    continue;
+                }
+
+                /* Deal with comments etc. */
+                if (InsertMisc(html, node))
+                    continue;
+
+                /* At this point, we didn't find a head tag, so put the
+                 token back and create our own head tag, so we can
+                 move on.
+                 */
+                TY_(UngetToken)( doc );
+                node = TY_(InferredTag)(doc, TidyTag_HEAD);
+                state = STATE_PARSE_HEAD;
+                keepToken = yes;
+                continue;
+            } break;
+
+
+                /**************************************************************
+                 This case determines whether we're dealing with body or
+                 frameset + noframes, and sets things up accordingly.
+                 **************************************************************/
+            case STATE_PRE_BODY:
+            {
+                if (node == NULL )
+                {
+                    if (frameset == NULL) /* Implied body. */
+                    {
+                        node = TY_(InferredTag)(doc, TidyTag_BODY);
+                        state = STATE_PARSE_BODY;
+                        keepToken = yes;
+                    } else {
+                        state = STATE_COMPLETE;
+                    }
+
+                    continue;
+                }
+
+                /* Robustly handle html tags. */
+                if (node->tag == html->tag)
+                {
+                    if (node->type != StartTag && frameset == NULL)
+                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
+
+                    TY_(FreeNode)( doc, node);
+                    continue;
+                }
+
+                /* Deal with comments etc. */
+                if (InsertMisc(html, node))
+                    continue;
+
+                /* If frameset document, coerce <body> to <noframes> */
+                if ( nodeIsBODY(node) )
+                {
+                    if (node->type != StartTag)
+                    {
+                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
+                        TY_(FreeNode)( doc, node);
+                        continue;
+                    }
+
+                    if ( cfg(doc, TidyAccessibilityCheckLevel) == 0 )
+                    {
+                        if (frameset != NULL)
+                        {
+                            TY_(UngetToken)( doc );
+
+                            if (noframes == NULL)
+                            {
+                                noframes = TY_(InferredTag)(doc, TidyTag_NOFRAMES);
+                                TY_(InsertNodeAtEnd)(frameset, noframes);
+                                TY_(Report)(doc, html, noframes, INSERTING_TAG);
+                            }
+                            else
+                            {
+                                if (noframes->type == StartEndTag)
+                                    noframes->type = StartTag;
+                            }
+
+                            state = STATE_PARSE_NOFRAMES;
+                            keepToken = yes;
+                            continue;
+                        }
+                    }
+
+                    TY_(ConstrainVersion)(doc, ~VERS_FRAMESET);
+                    state = STATE_PARSE_BODY;
+                    keepToken = yes;
+                    continue;
+                }
+
+                /* Flag an error if we see more than one frameset. */
+                if ( nodeIsFRAMESET(node) )
+                {
+                    if (node->type != StartTag)
+                    {
+                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
+                        TY_(FreeNode)( doc, node);
+                        continue;
+                    }
+
+                    if (frameset != NULL)
+                        TY_(Report)(doc, html, node, DUPLICATE_FRAMESET);
+                    else
+                        frameset = node;
+
+                    state = STATE_PARSE_FRAMESET;
+                    keepToken = yes;
+                    continue;
+                }
+
+                /* If not a frameset document coerce <noframes> to <body>. */
+                if ( nodeIsNOFRAMES(node) )
+                {
+                    if (node->type != StartTag)
+                    {
+                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
+                        TY_(FreeNode)( doc, node);
+                        continue;
+                    }
+
+                    if (frameset == NULL)
+                    {
+                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
+                        TY_(FreeNode)( doc, node);
+                        node = TY_(InferredTag)(doc, TidyTag_BODY);
+                        state = STATE_PARSE_BODY;
+                        keepToken = yes;
+                        continue;
+                    }
+
+                    if (noframes == NULL)
+                    {
+                        noframes = node;
+                        TY_(InsertNodeAtEnd)(frameset, noframes);
+                        state = STATE_PARSE_NOFRAMES;
+                        keepToken = yes;
+                    }
+                    else
+                    {
+                        TY_(FreeNode)( doc, node);
+                    }
+
+                    continue;
+                }
+
+                /* Deal with some other element that we're not expecting. */
+                if (TY_(nodeIsElement)(node))
+                {
+                    if (node->tag && node->tag->model & CM_HEAD)
+                    {
+                        MoveToHead(doc, html, node);
+                        continue;
+                    }
+
+                    /* Discard illegal frame element following a frameset. */
+                    if ( frameset != NULL && nodeIsFRAME(node) )
+                    {
+                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
+                        TY_(FreeNode)(doc, node);
+                        continue;
+                    }
+                }
+
+                TY_(UngetToken)( doc );
+
+                /* Insert other content into noframes element. */
+                if (frameset)
+                {
+                    if (noframes == NULL)
+                    {
+                        noframes = TY_(InferredTag)(doc, TidyTag_NOFRAMES);
+                        TY_(InsertNodeAtEnd)(frameset, noframes);
+                    }
+                    else
+                    {
+                        TY_(Report)(doc, html, node, NOFRAMES_CONTENT);
+                        if (noframes->type == StartEndTag)
+                            noframes->type = StartTag;
+                    }
+
+                    TY_(ConstrainVersion)(doc, VERS_FRAMESET);
+                    state = STATE_PARSE_NOFRAMES;
+                    keepToken = yes;
+                    continue;
+                }
+
+                node = TY_(InferredTag)(doc, TidyTag_BODY);
+
+                /* Issue #132 - disable inserting BODY tag warning
+                 BUT only if NOT --show-body-only yes */
+                if (!showingBodyOnly(doc))
+                    TY_(Report)(doc, html, node, INSERTING_TAG );
+
+                TY_(ConstrainVersion)(doc, ~VERS_FRAMESET);
+                state = STATE_PARSE_BODY;
+                keepToken = yes;
+                continue;
+            } break;
+
+
+                /**************************************************************
+                 In this case, we're ready to parse the head, and move on to
+                 look for the body or body alternative.
+                 **************************************************************/
+            case STATE_PARSE_HEAD:
+            {
+                TidyParserMemory memory;
+                memory.identity = TY_(ParseHTML);
+                memory.mode = mode;
+                memory.original_node = html;
+                memory.reentry_node = node;
+                memory.reentry_mode = mode;
+                memory.reentry_state = STATE_PARSE_HEAD_DONE;
+                TY_(InsertNodeAtEnd)(html, node);
+                pushMemory( doc, memory );
+                return node;
+            } break;
+
+            case STATE_PARSE_HEAD_DONE:
+            {
+                head = node;
+                state = STATE_PRE_BODY;
+            } break;
+
+
+                /**************************************************************
+                 In this case, we can finally parse a body.
+                 **************************************************************/
+            case STATE_PARSE_BODY:
+            {
+                TidyParserMemory memory;
+                memory.identity = NULL; /* we don't need to reenter */
+                memory.mode = mode;
+                memory.original_node = html;
+                memory.reentry_node = NULL;
+                memory.reentry_mode = mode;
+                memory.reentry_state = STATE_COMPLETE;
+                TY_(InsertNodeAtEnd)(html, node);
+                pushMemory( doc, memory );
+                return node;
+            } break;
+
+
+                /**************************************************************
+                 In this case, we will parse noframes. If necessary, the
+                 node is already inserted in the proper spot.
+                 **************************************************************/
+            case STATE_PARSE_NOFRAMES:
+            {
+                TidyParserMemory memory;
+                memory.identity = TY_(ParseHTML);
+                memory.mode = mode;
+                memory.original_node = html;
+                memory.reentry_node = frameset;
+                memory.reentry_mode = mode;
+                memory.reentry_state = STATE_PARSE_NOFRAMES_DONE;
+                pushMemory( doc, memory );
+                return noframes;
+            } break;
+
+            case STATE_PARSE_NOFRAMES_DONE:
+            {
+                frameset = node;
+                state = STATE_PRE_BODY;
+            } break;
+
+
+                /**************************************************************
+                 In this case, we parse the frameset, and look for noframes
+                 content to merge later if necessary.
+                 **************************************************************/
+            case STATE_PARSE_FRAMESET:
+            {
+                TidyParserMemory memory;
+                memory.identity = TY_(ParseHTML);
+                memory.mode = mode;
+                memory.original_node = html;
+                memory.reentry_node = frameset;
+                memory.reentry_mode = mode;
+                memory.reentry_state = STATE_PARSE_FRAMESET_DONE;
+                TY_(InsertNodeAtEnd)(html, node);
+                pushMemory( doc, memory );
+                return node;
+            } break;
+
+            case STATE_PARSE_FRAMESET_DONE:
+            {
+                frameset = node;
+                /* See if it includes a noframes element so that
+                 we can merge subsequent noframes elements.
+                 */
+                for (node = frameset->content; node; node = node->next)
+                {
+                    if ( nodeIsNOFRAMES(node) )
+                        noframes = node;
+                }
+                state = STATE_PRE_BODY;
+            } break;
+
+
+                /**************************************************************
+                 We really shouldn't get here, but if we do, finish nicely.
+                 **************************************************************/
+            default:
+            {
+                state = STATE_COMPLETE;
+            }
+        } /* switch */
+    } /* while */
+
+    DEBUG_LOG(SPRTF("Exit newParseHTML 2...\n"));
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseBlock)
+ *  `element` is a node created by the lexer upon seeing the start tag, or
+ *  by the parser when the start tag is inferred
+ */
+Node* TY_(ParseBlock)( TidyDocImpl* doc, Node *element, GetTokenMode mode, Bool popStack )
+{
+    TY_(oldParseBlock)( doc, element, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseNamespace)
+ *  Act as a generic XML (sub)tree parser: collect each node and add it
+ *  to the DOM, without any further validation.
+ *  @todo Add schema- or other-hierarchy-definition-based validation
+ *    of the subtree here.
+ */
+Node* TY_(ParseNamespace)( TidyDocImpl* doc, Node *basenode, GetTokenMode mode, Bool popStack )
+{
+    TY_(oldParseNamespace)( doc, basenode, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseInline)
+ *  Parse inline element nodes.
+ */
+Node* TY_(ParseInline)( TidyDocImpl *doc, Node *node, GetTokenMode mode, Bool popStack )
+{
+    TY_(oldParseInline)( doc, node, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseEmpty)
+ *  Parse empty element nodes.
+ */
+Node* TY_(ParseEmpty)( TidyDocImpl* doc, Node *element, GetTokenMode mode, Bool popStack )
+{
+    TY_(oldParseEmpty)( doc, element, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseDefList)
+ *  Parses the `dl` tag.
+ */
+Node* TY_(ParseDefList)( TidyDocImpl* doc, Node *list, GetTokenMode mode, Bool popStack )
+{
+    TY_(oldParseDefList)( doc, list, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseList)
+ *  Parses list tags.
+ */
+Node* TY_(ParseList)( TidyDocImpl* doc, Node *list, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseList)( doc, list, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseRow)
+ *  Parses the `row` tag.
+ */
+Node* TY_(ParseRow)( TidyDocImpl* doc, Node *row, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseRow)( doc, row, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseRowGroup)
+ *  Parses the `rowgroup` tag.
+ */
+Node* TY_(ParseRowGroup)( TidyDocImpl* doc, Node *rowgroup, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseRowGroup)( doc, rowgroup, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseColGroup)
+ *  Parses the `colgroup` tag.
+ */
+Node* TY_(ParseColGroup)( TidyDocImpl* doc, Node *colgroup, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseColGroup)( doc, colgroup, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseTableTag)
+ *  Parses the `table` tag.
+ */
+Node* TY_(ParseTableTag)( TidyDocImpl* doc, Node *table, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseTableTag)( doc, table, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParsePre)
+ *  Parses the `pre` tag.
+ */
+Node* TY_(ParsePre)( TidyDocImpl* doc, Node *pre, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParsePre)( doc, pre, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseOptGroup)
+ *  Parses the `optgroup` tag.
+ */
+Node* TY_(ParseOptGroup)( TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseOptGroup)( doc, field, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseSelect)
+ *  Parses the `select` tag.
+ */
+Node* TY_(ParseSelect)( TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseSelect)( doc, field, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseDataList)
+ *  Parses the `datalist` tag.
+ */
+Node* TY_(ParseDatalist)( TidyDocImpl* doc, Node *field, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseDatalist)( doc, field, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseText)
+ *  Parses the `option` and `textarea` tags.
+ */
+Node* TY_(ParseText)( TidyDocImpl* doc, Node *field, GetTokenMode mode, Bool popStack )
+{
+    TY_(oldParseText)( doc, field, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseTitle)
+ *  Parses the `title` tag.
+ */
+Node* TY_(ParseTitle)( TidyDocImpl* doc, Node *title, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseTitle)( doc, title, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseScript)
+ *  Parses the `script` tag.
+ *
+ *  @todo This isn't quite right for CDATA content as it recognises tags
+ *  within the content and parses them accordingly. This will unfortunately
+ *  screw up scripts which include:
+ *    < + letter
+ *    < + !
+ *    < + ?
+ *    < + / + letter
+ */
+Node* TY_(ParseScript)( TidyDocImpl* doc, Node *script, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseScript)( doc, script, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseHead)
+ *  Parses the `head` tag.
+ */
+Node* TY_(ParseHead)( TidyDocImpl* doc, Node *head, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseHead)( doc, head, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseBody)
+ *  Parses the `body` tag.
+ */
+Node* TY_(ParseBody)( TidyDocImpl* doc, Node *body, GetTokenMode mode, Bool popStack )
+{
+    TY_(oldParseBody)( doc, body, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseNoFrames)
+ *  Parses the `noframes` tag.
+ */
+Node* TY_(ParseNoFrames)( TidyDocImpl* doc, Node *noframes, GetTokenMode mode, Bool popStack )
+{
+    TY_(oldParseNoFrames)( doc, noframes, mode );
+    return NULL;
+}
+
+
+/** MARK: TY_(ParseFrameSet)
+ *  Parses the `frameset` tag.
+ */
+Node* TY_(ParseFrameSet)( TidyDocImpl* doc, Node *frameset, GetTokenMode ARG_UNUSED(mode), Bool popStack )
+{
+    TY_(oldParseFrameSet)( doc, frameset, mode );
+    return NULL;
+}
+
 
 
 /***************************************************************************//*
@@ -5448,526 +5801,6 @@ void TY_(ParseXMLDocument)(TidyDocImpl* doc)
     /* ensure presence of initial <?xml version="1.0"?> */
     if ( cfgBool(doc, TidyXmlDecl) )
         TY_(FixXmlDecl)( doc );
-}
-
-
-/***************************************************************************//*
- ** MARK: - Refactored Parser
- ***************************************************************************/
-
-
-/**
- *  The main parser body will populate the document's document root starting
- *  with the provided node, which generally should be the HTML node after the
- *  pre-HTML stuff is handled at a higher level.
- *
- *  This parser loops from the first available node to the last, and is
- *  compatible with the old recursive parsers during the transition.
- *
- *  Tempoarily manually handle these:
- *  Parser TY_(ParseHTML);
- *  Parser TY_(ParseHead);
- *  Parser TY_(ParseTitle);
- *  Parser TY_(ParseScript);
- *  Parser TY_(ParseFrameSet);
- *  Parser TY_(ParseNoFrames);
- *  Parser TY_(ParseBody);
- *  Parser TY_(ParsePre);
- *  Parser TY_(ParseList);
- *  Parser TY_(ParseDefList);
- *  Parser TY_(ParseBlock);
- *  Parser TY_(ParseInline);
- *  Parser TY_(ParseEmpty);
- *  Parser TY_(ParseTableTag);
- *  Parser TY_(ParseColGroup);
- *  Parser TY_(ParseRowGroup);
- *  Parser TY_(ParseRow);
- *  Parser TY_(ParseSelect);
- *  Parser TY_(ParseOptGroup);
- *  Parser TY_(ParseText);
- *  Parser TY_(ParseDatalist);
- *  Parser TY_(ParseNamespace);
- *
- */
-void ParseHTMLWithNode( TidyDocImpl* doc, Node* node )
-{
-    GetTokenMode mode = IgnoreWhitespace;
-    Bool keepToken = no;
-    oldParser* parser = NULL;
-
-    /*
-     This main loop is only extinguished when all of the parser tokens are
-     consumed. Although we do have some delegation to lower level stack frames,
-     this loop is the master loop for the entire lexer content.
-     */
-    do
-    {
-        /* What do we do? */
-        if ( (parser = GetParserForNode( doc, node )) )
-        {
-            /*
-             While migrating the old parsers, we will manually call the
-             new parser when an old parser is specified.
-             */
-            if ( parser == TY_(ParseHTML) )
-            {
-                /* Use the new parser. */
-                node = TY_(NewParseHTML)( doc, node, mode, no );
-
-                if ( node )
-                {
-                    /*
-                     When a parser returns a node, it means that we have
-                     to continue the loop, because it indicates that it's
-                     an instruction for nested processing.
-                     */
-                    mode = peekMemoryMode( doc );
-                    continue;
-                }
-
-            } else {
-                /* Parse recursively using old style parser. */
-                (*parser)( doc, node, mode );
-            }
-        }
-
-
-        /*
-         If there's something on the stack, we need to handle that
-         before getting the next token.
-         */
-        if ( !isEmptyParserStack( doc ) )
-        {
-            Parser* func = peekMemoryIdentity( doc );
-            if ( func )
-            {
-                if ( (node = func( doc, NULL, 0, yes )) )
-                    continue;
-            } else {
-                /* No function was defined, but there's an empty record. */
-                popMemory( doc );
-            }
-
-        }
-
-
-
-        /* We don't want to get the next token unless we're
-           done with this one. Using this flag is much quicker
-           than using `UngetToken()` every time we want to keep
-           the token.
-         */
-        if ( !keepToken )
-            node = TY_(GetToken)( doc, mode );
-        keepToken = no;
-
-    } while ( node );
-}
-
-
-/** MARK: TY_(NewParseHTML)
- *  Parses the `html` tag. At this point, other root-level stuff (doctype,
- *  comments) are already set up, and the bulk of the parsing can be
- *  conducted from here as our nexus.
- */
-Node* TY_(NewParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool popStack )
-{
-    Node *node = NULL;
-    Node *head = NULL;
-    Node *frameset = NULL;
-    Node *noframes = NULL;
-    Bool keepToken = no;
-    parserState state = STATE_INITIAL;
-
-    DEBUG_LOG(SPRTF("\nEntering NewParseHTML...\n\n"));
-
-    TY_(SetOptionBool)( doc, TidyXmlTags, no );
-
-    /* We are re-entering to finish up some work. */
-    if ( popStack )
-    {
-        TidyParserMemory memory = popMemory( doc );
-        node = memory.reentry_node;
-        mode = memory.reentry_mode;
-        state = memory.reentry_state;
-        html = memory.original_node;
-        keepToken = node != NULL;
-    }
-
-    /* This main loop is only extinguished when all of the parser
-       tokens are consumed. Although we do have some delegation to
-       lower level stack frames, this loop is the master loop for
-       the entire lexer content.
-     */
-    while ( state != STATE_COMPLETE )
-    {
-        /* We don't want to get the next token unless we're
-           done with this one. Using this flag is much quicker
-           than using `UngetToken()` every time we want to keep
-           the token.
-         */
-        if ( !keepToken )
-            node = TY_(GetToken)( doc, IgnoreWhitespace );
-        keepToken = no;
-
-        switch ( state )
-        {
-            /**************************************************************
-             This case is all about finding a head tag and dealing with
-             cases were we don't, so that we can move on to parsing a head
-             tag.
-             **************************************************************/
-            case STATE_INITIAL:
-            {
-                /* The only way we can possibly be here is if the lexer
-                   had nothing to give us. Thus we'll create our own
-                   head, and set the signal to start parsing it.
-                 */
-                if (node == NULL)
-                {
-                    node = TY_(InferredTag)(doc, TidyTag_HEAD);
-                    state = STATE_PARSE_HEAD;
-                    keepToken = yes;
-                    continue;
-                }
-
-                /* We found exactly what we expected: head. */
-                if ( nodeIsHEAD(node) )
-                {
-                    state = STATE_PARSE_HEAD;
-                    keepToken = yes;
-                    continue;
-                }
-
-                /* We did not expect to find an html closing tag here! */
-                if (node->tag == html->tag && node->type == EndTag)
-                {
-                    TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                    TY_(FreeNode)( doc, node);
-                    continue;
-                }
-
-                /* Find and discard multiple <html> elements. */
-                if (node->tag == html->tag && node->type == StartTag)
-                {
-                    TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                    TY_(FreeNode)(doc, node);
-                    continue;
-                }
-
-                /* Deal with comments etc. */
-                if (InsertMisc(html, node))
-                    continue;
-
-                /* At this point, we didn't find a head tag, so put the
-                   token back and create our own head tag, so we can
-                   move on.
-                 */
-                TY_(UngetToken)( doc );
-                node = TY_(InferredTag)(doc, TidyTag_HEAD);
-                state = STATE_PARSE_HEAD;
-                keepToken = yes;
-                continue;
-            } break;
-
-
-            /**************************************************************
-             This case determines whether we're dealing with body or
-             frameset + noframes, and sets things up accordingly.
-             **************************************************************/
-            case STATE_PRE_BODY:
-            {
-                if (node == NULL )
-                {
-                    if (frameset == NULL) /* Implied body. */
-                    {
-                        node = TY_(InferredTag)(doc, TidyTag_BODY);
-                        state = STATE_PARSE_BODY;
-                        keepToken = yes;
-                    } else {
-                        state = STATE_COMPLETE;
-                    }
-
-                    continue;
-                }
-
-                /* Robustly handle html tags. */
-                if (node->tag == html->tag)
-                {
-                    if (node->type != StartTag && frameset == NULL)
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-
-                    TY_(FreeNode)( doc, node);
-                    continue;
-                }
-
-                /* Deal with comments etc. */
-                if (InsertMisc(html, node))
-                    continue;
-
-                /* If frameset document, coerce <body> to <noframes> */
-                if ( nodeIsBODY(node) )
-                {
-                    if (node->type != StartTag)
-                    {
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                        TY_(FreeNode)( doc, node);
-                        continue;
-                    }
-
-                    if ( cfg(doc, TidyAccessibilityCheckLevel) == 0 )
-                    {
-                        if (frameset != NULL)
-                        {
-                            TY_(UngetToken)( doc );
-
-                            if (noframes == NULL)
-                            {
-                                noframes = TY_(InferredTag)(doc, TidyTag_NOFRAMES);
-                                TY_(InsertNodeAtEnd)(frameset, noframes);
-                                TY_(Report)(doc, html, noframes, INSERTING_TAG);
-                            }
-                            else
-                            {
-                                if (noframes->type == StartEndTag)
-                                    noframes->type = StartTag;
-                            }
-
-                            state = STATE_PARSE_NOFRAMES;
-                            keepToken = yes;
-                            continue;
-                        }
-                    }
-
-                    TY_(ConstrainVersion)(doc, ~VERS_FRAMESET);
-                    state = STATE_PARSE_BODY;
-                    keepToken = yes;
-                    continue;
-                }
-
-                /* Flag an error if we see more than one frameset. */
-                if ( nodeIsFRAMESET(node) )
-                {
-                    if (node->type != StartTag)
-                    {
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                        TY_(FreeNode)( doc, node);
-                        continue;
-                    }
-
-                    if (frameset != NULL)
-                        TY_(Report)(doc, html, node, DUPLICATE_FRAMESET);
-                    else
-                        frameset = node;
-
-                    state = STATE_PARSE_FRAMESET;
-                    keepToken = yes;
-                    continue;
-                }
-
-                /* If not a frameset document coerce <noframes> to <body>. */
-                if ( nodeIsNOFRAMES(node) )
-                {
-                    if (node->type != StartTag)
-                    {
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                        TY_(FreeNode)( doc, node);
-                        continue;
-                    }
-
-                    if (frameset == NULL)
-                    {
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                        TY_(FreeNode)( doc, node);
-                        node = TY_(InferredTag)(doc, TidyTag_BODY);
-                        state = STATE_PARSE_BODY;
-                        keepToken = yes;
-                        continue;
-                    }
-
-                    if (noframes == NULL)
-                    {
-                        noframes = node;
-                        TY_(InsertNodeAtEnd)(frameset, noframes);
-                        state = STATE_PARSE_NOFRAMES;
-                        keepToken = yes;
-                    }
-                    else
-                    {
-                        TY_(FreeNode)( doc, node);
-                    }
-
-                    continue;
-                }
-
-                /* Deal with some other element that we're not expecting. */
-                if (TY_(nodeIsElement)(node))
-                {
-                    if (node->tag && node->tag->model & CM_HEAD)
-                    {
-                        MoveToHead(doc, html, node);
-                        continue;
-                    }
-
-                    /* Discard illegal frame element following a frameset. */
-                    if ( frameset != NULL && nodeIsFRAME(node) )
-                    {
-                        TY_(Report)(doc, html, node, DISCARDING_UNEXPECTED);
-                        TY_(FreeNode)(doc, node);
-                        continue;
-                    }
-                }
-
-                TY_(UngetToken)( doc );
-
-                /* Insert other content into noframes element. */
-                if (frameset)
-                {
-                    if (noframes == NULL)
-                    {
-                        noframes = TY_(InferredTag)(doc, TidyTag_NOFRAMES);
-                        TY_(InsertNodeAtEnd)(frameset, noframes);
-                    }
-                    else
-                    {
-                        TY_(Report)(doc, html, node, NOFRAMES_CONTENT);
-                        if (noframes->type == StartEndTag)
-                            noframes->type = StartTag;
-                    }
-
-                    TY_(ConstrainVersion)(doc, VERS_FRAMESET);
-                    state = STATE_PARSE_NOFRAMES;
-                    keepToken = yes;
-                    continue;
-                }
-
-                node = TY_(InferredTag)(doc, TidyTag_BODY);
-
-                /* Issue #132 - disable inserting BODY tag warning
-                   BUT only if NOT --show-body-only yes */
-                if (!showingBodyOnly(doc))
-                    TY_(Report)(doc, html, node, INSERTING_TAG );
-
-                TY_(ConstrainVersion)(doc, ~VERS_FRAMESET);
-                state = STATE_PARSE_BODY;
-                keepToken = yes;
-                continue;
-            } break;
-
-
-            /**************************************************************
-             In this case, we're ready to parse the head, and move on to
-             look for the body or body alternative.
-             **************************************************************/
-            case STATE_PARSE_HEAD:
-            {
-                TidyParserMemory memory;
-                memory.identity = TY_(NewParseHTML);
-                memory.mode = mode;
-                memory.original_node = html;
-                memory.reentry_node = node;
-                memory.reentry_mode = mode;
-                memory.reentry_state = STATE_PARSE_HEAD_DONE;
-                TY_(InsertNodeAtEnd)(html, node);
-                pushMemory( doc, memory );
-                return node;
-            } break;
-
-            case STATE_PARSE_HEAD_DONE:
-            {
-                head = node;
-                state = STATE_PRE_BODY;
-            } break;
-
-
-            /**************************************************************
-             In this case, we can finally parse a body.
-             **************************************************************/
-            case STATE_PARSE_BODY:
-            {
-                TidyParserMemory memory;
-                memory.identity = NULL; /* we don't need to reenter */
-                memory.mode = mode;
-                memory.original_node = html;
-                memory.reentry_node = NULL;
-                memory.reentry_mode = mode;
-                memory.reentry_state = STATE_COMPLETE;
-                TY_(InsertNodeAtEnd)(html, node);
-                pushMemory( doc, memory );
-                return node;
-            } break;
-
-
-            /**************************************************************
-             In this case, we will parse noframes. If necessary, the
-             node is already inserted in the proper spot.
-             **************************************************************/
-            case STATE_PARSE_NOFRAMES:
-            {
-                TidyParserMemory memory;
-                memory.identity = TY_(NewParseHTML);
-                memory.mode = mode;
-                memory.original_node = html;
-                memory.reentry_node = frameset;
-                memory.reentry_mode = mode;
-                memory.reentry_state = STATE_PARSE_NOFRAMES_DONE;
-                pushMemory( doc, memory );
-                return noframes;
-            } break;
-
-            case STATE_PARSE_NOFRAMES_DONE:
-            {
-                frameset = node;
-                state = STATE_PRE_BODY;
-            } break;
-
-
-            /**************************************************************
-             In this case, we parse the frameset, and look for noframes
-             content to merge later if necessary.
-             **************************************************************/
-            case STATE_PARSE_FRAMESET:
-            {
-                TidyParserMemory memory;
-                memory.identity = TY_(NewParseHTML);
-                memory.mode = mode;
-                memory.original_node = html;
-                memory.reentry_node = frameset;
-                memory.reentry_mode = mode;
-                memory.reentry_state = STATE_PARSE_FRAMESET_DONE;
-                TY_(InsertNodeAtEnd)(html, node);
-                pushMemory( doc, memory );
-                return node;
-            } break;
-
-            case STATE_PARSE_FRAMESET_DONE:
-            {
-                frameset = node;
-                /* See if it includes a noframes element so that
-                   we can merge subsequent noframes elements.
-                 */
-                for (node = frameset->content; node; node = node->next)
-                {
-                    if ( nodeIsNOFRAMES(node) )
-                        noframes = node;
-                }
-                state = STATE_PRE_BODY;
-            } break;
-
-
-            /**************************************************************
-             We really shouldn't get here, but if we do, finish nicely.
-             **************************************************************/
-            default:
-            {
-                state = STATE_COMPLETE;
-            }
-        } /* switch */
-    } /* while */
-
-    DEBUG_LOG(SPRTF("Exit newParseHTML 2...\n"));
-//    parserMemory result = { NULL };
-    return NULL;
 }
 
 

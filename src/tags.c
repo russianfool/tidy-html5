@@ -451,7 +451,7 @@ static void FreeDict( TidyDocImpl* doc, Dict *d )
 
 static void declare( TidyDocImpl* doc, TidyTagImpl* tags,
                      ctmbstr name, uint versions, uint model,
-                     oldParser *parser, CheckAttribs *chkattrs )
+                     Parser *parser, CheckAttribs *chkattrs )
 {
     if ( name )
     {
@@ -602,7 +602,7 @@ const Dict* TY_(LookupTagDef)( TidyTagId tid )
     return NULL;
 }
 
-oldParser* TY_(FindParser)( TidyDocImpl* doc, Node *node )
+Parser* TY_(FindParser)( TidyDocImpl* doc, Node *node )
 {
     const Dict* np = tagsLookup( doc, &doc->tags, node->element );
     if ( np )
@@ -612,7 +612,7 @@ oldParser* TY_(FindParser)( TidyDocImpl* doc, Node *node )
 
 void TY_(DefineTag)( TidyDocImpl* doc, UserTagType tagType, ctmbstr name )
 {
-    oldParser* parser = 0;
+    Parser* parser = 0;
     uint cm = CM_UNKNOWN;
     uint vers = VERS_PROPRIETARY;
 

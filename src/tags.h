@@ -61,11 +61,6 @@ typedef enum
 
 
 /** This typedef describes a function to be used to parse HTML of a Tidy tag.
- */
-typedef void* (oldParser)( TidyDocImpl* doc, Node *node, GetTokenMode mode );
-
-
-/** This typedef describes a function to be used to parse HTML of a Tidy tag.
  ** @param doc The Tidy document.
  ** @param node The node being parsed.
  ** @param mode The GetTokenMode to be used for parsing the node contents.
@@ -91,7 +86,7 @@ struct _Dict
     uint                versions; /**< Accumulates potential HTML versions. See TY_(ConstrainVersion). */
     AttrVersion const * attrvers; /**< Accumulates potential HTML versions for attributes. */
     uint                model;    /**< Indicates the relevant content models for the tag. See lexer.h; there is no enum. */
-    oldParser*          parser;   /**< Specifies the parser to use for this tag. */
+    Parser*             parser;   /**< Specifies the parser to use for this tag. */
     CheckAttribs*       chkattrs; /**< Specifies the function to check this tag's attributes. */
     Dict*               next;     /**< Link to next tag. */
 };
@@ -151,7 +146,7 @@ Bool    TY_(FindTag)( TidyDocImpl* doc, Node *node );
  ** @param node The node to lookup.
  ** @returns The parser for the given node.
  */
-oldParser* TY_(FindParser)( TidyDocImpl* doc, Node *node );
+Parser* TY_(FindParser)( TidyDocImpl* doc, Node *node );
 
 
 /** Defines a new user-defined tag.
@@ -237,28 +232,28 @@ Bool TY_(IsHTML5Mode)( TidyDocImpl *doc );
 /** @{ */
 
 
-oldParser TY_(ParseHTML);
-oldParser TY_(ParseHead);
-oldParser TY_(ParseTitle);
-oldParser TY_(ParseScript);
-oldParser TY_(ParseFrameSet);
-oldParser TY_(ParseNoFrames);
-oldParser TY_(ParseBody);
-oldParser TY_(ParsePre);
-oldParser TY_(ParseList);
-oldParser TY_(ParseDefList);
-oldParser TY_(ParseBlock);
-oldParser TY_(ParseInline);
-oldParser TY_(ParseEmpty);
-oldParser TY_(ParseTableTag);
-oldParser TY_(ParseColGroup);
-oldParser TY_(ParseRowGroup);
-oldParser TY_(ParseRow);
-oldParser TY_(ParseSelect);
-oldParser TY_(ParseOptGroup);
-oldParser TY_(ParseText);
-oldParser TY_(ParseDatalist);
-oldParser TY_(ParseNamespace);
+Parser TY_(ParseHTML);
+Parser TY_(ParseHead);
+Parser TY_(ParseTitle);
+Parser TY_(ParseScript);
+Parser TY_(ParseFrameSet);
+Parser TY_(ParseNoFrames);
+Parser TY_(ParseBody);
+Parser TY_(ParsePre);
+Parser TY_(ParseList);
+Parser TY_(ParseDefList);
+Parser TY_(ParseBlock);
+Parser TY_(ParseInline);
+Parser TY_(ParseEmpty);
+Parser TY_(ParseTableTag);
+Parser TY_(ParseColGroup);
+Parser TY_(ParseRowGroup);
+Parser TY_(ParseRow);
+Parser TY_(ParseSelect);
+Parser TY_(ParseOptGroup);
+Parser TY_(ParseText);
+Parser TY_(ParseDatalist);
+Parser TY_(ParseNamespace);
 
 CheckAttribs TY_(CheckAttributes);
 
