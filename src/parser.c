@@ -22,6 +22,7 @@
 
 static void ParseTag( TidyDocImpl* doc, Node *node, GetTokenMode mode );
 void ParseHTMLWithNode( TidyDocImpl* doc, Node* html );
+Node* TY_(NewParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool popStack );
 
 
 /****************************************************************************//*
@@ -843,14 +844,13 @@ void TY_(FreeParserStack)( TidyDocImpl* doc )
 static void growParserStack( TidyDocImpl* doc )
 {
     TidyParserMemory *content;
-    TidyParserStack stack = doc->stack;
-    content = (TidyParserMemory *) TidyAlloc( stack.allocator, sizeof(TidyParserMemory) * stack.size * 2 );
+    content = (TidyParserMemory *) TidyAlloc( doc->stack.allocator, sizeof(TidyParserMemory) * doc->stack.size * 2 );
 
-    memcpy( content, stack.content, sizeof(TidyParserMemory) * (stack.top + 1) );
-    TidyFree(stack.allocator, stack.content);
+    memcpy( content, doc->stack.content, sizeof(TidyParserMemory) * (doc->stack.top + 1) );
+    TidyFree(doc->stack.allocator, doc->stack.content);
 
-    stack.content = content;
-    stack.size = stack.size * 2;
+    doc->stack.content = content;
+    doc->stack.size = doc->stack.size * 2;
 }
 
 
@@ -868,13 +868,11 @@ static Bool isEmptyParserStack( TidyDocImpl* doc )
  */
 static void pushMemory( TidyDocImpl* doc, TidyParserMemory data )
 {
-    TidyParserStack stack = doc->stack;
-
-    if ( stack.top == stack.size - 1 )
+    if ( doc->stack.top == doc->stack.size - 1 )
         growParserStack( doc );
 
-    stack.top = stack.top + 1;
-    stack.content[stack.top] = data;
+    doc->stack.top++;
+    doc->stack.content[doc->stack.top] = data;
 }
 
 
@@ -888,15 +886,32 @@ static TidyParserMemory peekMemory( TidyDocImpl* doc )
 
 
 /**
+ *  Peek at the parser memory "mode" field.
+ */
+static GetTokenMode peekMemoryMode( TidyDocImpl* doc )
+{
+    return doc->stack.content[doc->stack.top].mode;
+}
+
+
+/**
+ *  Peek at the parser memory "identity" field.
+ */
+static Parser* peekMemoryIdentity( TidyDocImpl* doc )
+{
+    return doc->stack.content[doc->stack.top].identity;
+}
+
+
+/**
  *  Pop out a parser memory.
  */
 static TidyParserMemory popMemory( TidyDocImpl* doc )
 {
-    TidyParserStack stack = doc->stack;
     if ( !isEmptyParserStack( doc ) )
     {
-        TidyParserMemory data = stack.content[stack.top];
-        stack.top = stack.top - 1;
+        TidyParserMemory data = doc->stack.content[doc->stack.top];
+        doc->stack.top = doc->stack.top - 1;
         return data;
     }
     TidyParserMemory blank = { NULL };
@@ -5480,20 +5495,35 @@ void ParseHTMLWithNode( TidyDocImpl* doc, Node* node )
     Bool keepToken = no;
     oldParser* parser = NULL;
 
-    /* This main loop is only extinguished when all of the parser
-       tokens are consumed. Although we do have some delegation to
-       lower level stack frames, this loop is the master loop for
-       the entire lexer content.
+    /*
+     This main loop is only extinguished when all of the parser tokens are
+     consumed. Although we do have some delegation to lower level stack frames,
+     this loop is the master loop for the entire lexer content.
      */
     do
     {
         /* What do we do? */
         if ( (parser = GetParserForNode( doc, node )) )
         {
+            /*
+             While migrating the old parsers, we will manually call the
+             new parser when an old parser is specified.
+             */
             if ( parser == TY_(ParseHTML) )
             {
                 /* Use the new parser. */
-                (*parser)( doc, node, mode );
+                node = TY_(NewParseHTML)( doc, node, mode, no );
+
+                if ( node )
+                {
+                    /*
+                     When a parser returns a node, it means that we have
+                     to continue the loop, because it indicates that it's
+                     an instruction for nested processing.
+                     */
+                    mode = peekMemoryMode( doc );
+                    continue;
+                }
 
             } else {
                 /* Parse recursively using old style parser. */
@@ -5501,10 +5531,31 @@ void ParseHTMLWithNode( TidyDocImpl* doc, Node* node )
             }
         }
 
+
+        /*
+         If there's something on the stack, we need to handle that
+         before getting the next token.
+         */
+        if ( !isEmptyParserStack( doc ) )
+        {
+            Parser* func = peekMemoryIdentity( doc );
+            if ( func )
+            {
+                if ( (node = func( doc, NULL, 0, yes )) )
+                    continue;
+            } else {
+                /* No function was defined, but there's an empty record. */
+                popMemory( doc );
+            }
+
+        }
+
+
+
         /* We don't want to get the next token unless we're
-         done with this one. Using this flag is much quicker
-         than using `UngetToken()` every time we want to keep
-         the token.
+           done with this one. Using this flag is much quicker
+           than using `UngetToken()` every time we want to keep
+           the token.
          */
         if ( !keepToken )
             node = TY_(GetToken)( doc, mode );
@@ -5527,7 +5578,6 @@ Node* TY_(NewParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool p
     Node *noframes = NULL;
     Bool keepToken = no;
     parserState state = STATE_INITIAL;
-    TidyParserMemory memory;
 
     DEBUG_LOG(SPRTF("\nEntering NewParseHTML...\n\n"));
 
@@ -5536,11 +5586,12 @@ Node* TY_(NewParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool p
     /* We are re-entering to finish up some work. */
     if ( popStack )
     {
-        memory = popMemory( doc );
+        TidyParserMemory memory = popMemory( doc );
         node = memory.reentry_node;
         mode = memory.reentry_mode;
         state = memory.reentry_state;
-        keepToken = yes;
+        html = memory.original_node;
+        keepToken = node != NULL;
     }
 
     /* This main loop is only extinguished when all of the parser
@@ -5813,10 +5864,11 @@ Node* TY_(NewParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool p
                 TidyParserMemory memory;
                 memory.identity = TY_(NewParseHTML);
                 memory.mode = mode;
+                memory.original_node = html;
                 memory.reentry_node = node;
                 memory.reentry_mode = mode;
                 memory.reentry_state = STATE_PARSE_HEAD_DONE;
-                TY_(InsertNodeAtEnd)(html, head);
+                TY_(InsertNodeAtEnd)(html, node);
                 pushMemory( doc, memory );
                 return node;
             } break;
@@ -5836,10 +5888,12 @@ Node* TY_(NewParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool p
                 TidyParserMemory memory;
                 memory.identity = NULL; /* we don't need to reenter */
                 memory.mode = mode;
+                memory.original_node = html;
                 memory.reentry_node = NULL;
                 memory.reentry_mode = mode;
                 memory.reentry_state = STATE_COMPLETE;
                 TY_(InsertNodeAtEnd)(html, node);
+                pushMemory( doc, memory );
                 return node;
             } break;
 
@@ -5850,12 +5904,21 @@ Node* TY_(NewParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool p
              **************************************************************/
             case STATE_PARSE_NOFRAMES:
             {
+                TidyParserMemory memory;
                 memory.identity = TY_(NewParseHTML);
                 memory.mode = mode;
-                memory.reentry_node = node;
+                memory.original_node = html;
+                memory.reentry_node = frameset;
                 memory.reentry_mode = mode;
-                memory.reentry_state = STATE_PRE_BODY;
+                memory.reentry_state = STATE_PARSE_NOFRAMES_DONE;
+                pushMemory( doc, memory );
                 return noframes;
+            } break;
+
+            case STATE_PARSE_NOFRAMES_DONE:
+            {
+                frameset = node;
+                state = STATE_PRE_BODY;
             } break;
 
 
@@ -5865,12 +5928,15 @@ Node* TY_(NewParseHTML)( TidyDocImpl *doc, Node *html, GetTokenMode mode, Bool p
              **************************************************************/
             case STATE_PARSE_FRAMESET:
             {
+                TidyParserMemory memory;
                 memory.identity = TY_(NewParseHTML);
                 memory.mode = mode;
+                memory.original_node = html;
                 memory.reentry_node = frameset;
                 memory.reentry_mode = mode;
                 memory.reentry_state = STATE_PARSE_FRAMESET_DONE;
                 TY_(InsertNodeAtEnd)(html, node);
+                pushMemory( doc, memory );
                 return node;
             } break;
 

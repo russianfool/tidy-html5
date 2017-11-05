@@ -55,6 +55,7 @@ typedef enum {
     STATE_PARSE_HEAD,          /**< In this state, we will setup head for parsing. */
     STATE_PARSE_HEAD_DONE,     /**< Resume here after parsing head. */
     STATE_PARSE_NOFRAMES,      /**< In this state, we can parse noframes content. */
+    STATE_PARSE_NOFRAMES_DONE, /**< In this state, we can restore more state. */
     STATE_PARSE_FRAMESET,      /**< In this state, we will parse frameset content. */
     STATE_PARSE_FRAMESET_DONE, /**< We need to cleanup some things after parsing frameset. */
 } parserState;
@@ -66,6 +67,7 @@ typedef enum {
 typedef struct _TidyParserMemory
 {
     Parser       *identity;      /**< Which parser pushed this record? */
+    Node         *original_node; /**< Originally provided node at entry. */
     Node         *reentry_node;  /**< A node a parser might want to save. */
     GetTokenMode reentry_mode;   /**< The mode to use for the next node. */
     parserState  reentry_state;  /**< State to set during re-entry. */
